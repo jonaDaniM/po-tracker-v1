@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <base target="_top">
+  <?!= includePo_('Styles'); ?>
+</head>
+<body>
+  <header class="app-header">
+    <div><p class="eyebrow">MATERIAL OPERATIONS</p><h1><?= applicationTitle ?></h1></div>
+    <div class="session"><span id="environmentBadge" class="badge">Loading</span><span id="userLabel"></span></div>
+  </header>
+
+  <nav id="navigation" class="nav" aria-label="Application sections">
+    <button data-view="field" class="active">Field</button>
+    <button data-view="admin" data-capability="admin">Admin</button>
+    <button data-view="owner" data-capability="owner">Owner</button>
+  </nav>
+
+  <main>
+    <section id="view-field" class="view active">
+      <div class="hero panel">
+        <div><p class="eyebrow">SEARCH MATERIAL</p><h2>Find a PO or line</h2><p>Field users search and view by PO number. Admin users can also search by Req, job, account, or internal line ID.</p></div>
+        <form id="searchForm" class="search-row"><input id="searchInput" autocomplete="off" placeholder="e.g. PO number, job, account"><button class="primary">Search</button></form>
+      </div>
+      <div id="searchResults" class="stack"></div>
+      <div id="orderDetail" class="stack"></div>
+    </section>
+
+    <section id="view-admin" class="view">
+      <div class="section-heading"><div><p class="eyebrow">MATERIAL ADMIN</p><h2>Operations dashboard</h2></div><button id="refreshAdmin">Refresh</button></div>
+      <div id="adminKpis" class="kpi-grid"></div>
+      <article class="panel admin-documents-panel">
+        <div class="section-heading"><div><h3>Documents dashboard</h3><p class="meta">Recent requisitions load as lightweight summaries. Expand a document only when you need the individual line statuses.</p></div><button id="refreshAdminDocuments" type="button">Refresh documents</button></div>
+        <form id="adminDocumentSearchForm" class="search-row"><input id="adminDocumentSearch" autocomplete="off" placeholder="Order, vendor PO, job, account, or line ID"><button class="primary">Search</button><button id="clearAdminDocumentSearch" type="button">Clear</button></form>
+        <div id="adminDocumentsList" class="compact-list"><p class="meta">Loading document summaries...</p></div>
+        <div id="adminDocumentsPager" class="button-row" hidden><button id="loadMoreAdminDocuments" type="button">Load more</button></div>
+      </article>
+      <div class="two-column">
+        <article class="panel admin-edit-only"><h3>Import requisitions</h3><p>Files are uploaded and parsed sequentially. Review every staged document before publishing.</p>
+          <div class="file-row"><input id="importFiles" type="file" accept=".xls,.xlsx" multiple><button id="clearImportFiles" type="button">Clear files</button></div><textarea id="importNotes" placeholder="Batch notes (optional)"></textarea><button id="startImport" class="primary">Create and upload batch</button><div id="importProgress"></div>
+        </article>
+        <article class="panel"><h3>Operational queues</h3><div id="queueTabs" class="chip-row"></div><div id="queueList" class="compact-list"></div></article>
+      </div>
+    </section>
+
+    <section id="view-owner" class="view">
+      <div class="section-heading"><div><p class="eyebrow">SYSTEM OWNER</p><h2>Controls and assurance</h2></div><button id="refreshOwner">Refresh</button></div>
+      <div class="two-column">
+        <article class="panel"><h3>Configuration</h3><div id="configurationList"></div></article>
+        <article class="panel"><h3>Users</h3><form id="userForm" class="form-grid"><input id="userEmail" type="email" placeholder="Email" required><input id="userName" placeholder="Display name"><select id="userProfile"><option value="FIELD">Field User</option><option value="ADMIN_READ_ONLY">Admin</option><option value="ADMIN_EDITOR">Admin Edit</option><option value="OWNER">System Owner</option></select><label><input id="userActive" type="checkbox" checked> Active</label><textarea id="userNotes" placeholder="Notes"></textarea><button class="primary">Save user</button></form><div id="userList" class="compact-list"></div></article>
+        <article class="panel"><h3>Backup and diagnostics</h3><div class="button-row"><button id="createBackup">Create backup</button><button id="migrateSchema">Migrate schema</button><button id="runHealth">Run health check</button></div><pre id="healthResult" class="result-box"></pre></article>
+        <article class="panel"><h3>Compensating correction</h3><p>Only the latest transaction on a line can be corrected. A backup is required automatically.</p><input id="correctionTransaction" placeholder="Transaction ID"><textarea id="correctionReason" placeholder="Reason (minimum 10 characters)"></textarea><button id="previewCorrection">Preview correction</button><div id="correctionPreview"></div></article>
+        <article class="panel"><h3>Recent field actions</h3><div id="ownerTransactions" class="compact-list"></div></article>
+        <article class="panel"><h3>Correction history</h3><div id="correctionHistory" class="compact-list"></div></article>
+        <article class="panel"><h3>Deleted records</h3><p class="meta">Visible to Owners only. Admin deletes are soft-deletes and remain here for review.</p><div id="deletionHistory" class="compact-list"></div></article>
+      </div>
+    </section>
+  </main>
+
+  <div id="modal" class="modal" hidden><div class="modal-card"><button id="closeModal" class="icon-button" aria-label="Close">×</button><div id="modalBody"></div></div></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="busy" class="busy" hidden><span class="spinner"></span><span id="busyLabel">Working…</span></div>
+  <?!= includePo_('Client'); ?>
+</body>
+</html>

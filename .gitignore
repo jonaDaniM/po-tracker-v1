@@ -1,0 +1,17 @@
+.DS_Store
+.clasp.json
+.clasprc.json
+node_modules/
+dist/
+build/
+coverage/
+outputs/
+*.log
+*.tmp
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.tsv
+*.zip
+

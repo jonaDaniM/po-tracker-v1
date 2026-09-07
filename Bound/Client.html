@@ -1,0 +1,960 @@
+<script>
+const state = {
+  bootstrap: null,
+  currentDetail: null,
+  admin: null,
+  owner: null,
+  currentQueue: 'overdue',
+  currentImportBatchId: '',
+  adminDocuments: {items: [], nextCursor: '', query: '', loading: false},
+  adminDocumentDetails: {},
+  adminDocumentErrors: {},
+  expandedAdminDocuments: {}
+};
+const $ = selector => document.querySelector(selector);
+const $$ = selector => Array.from(document.querySelectorAll(selector));
+const escapeHtml = value => String(value == null ? '' : value).replace(/[&<>"]/g, char => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[char]));
+const formatNumber = value => new Intl.NumberFormat(undefined, {maximumFractionDigits: 3}).format(Number(value) || 0);
+const formatDate = value => {
+  if (!value) return '-';
+  const text = String(value);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(text) ? new Date(Number(text.slice(0, 4)), Number(text.slice(5, 7)) - 1, Number(text.slice(8, 10))) : new Date(value);
+  return Number.isNaN(date.getTime()) ? escapeHtml(value) : date.toLocaleDateString();
+};
+const idempotency = prefix => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+function callServer(name, ...args) {
+  return new Promise((resolve, reject) => {
+    google.script.run.withSuccessHandler(resolve).withFailureHandler(error => reject(new Error(error && error.message ? error.message : String(error))))[name](...args);
+  });
+}
+
+function busy(label) {
+  $('#busyLabel').textContent = label || 'Working...';
+  $('#busy').hidden = false;
+}
+
+function idle() {
+  $('#busy').hidden = true;
+}
+
+function toast(message, error = false) {
+  const el = $('#toast');
+  el.textContent = message;
+  el.className = 'toast show' + (error ? ' error' : '');
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => el.className = 'toast', 4500);
+}
+
+function fail(error) {
+  idle();
+  toast(error.message || String(error), true);
+}
+
+function openModal(html) {
+  $('#modalBody').innerHTML = html;
+  $('#modal').hidden = false;
+}
+
+function closeModal() {
+  $('#modal').hidden = true;
+  $('#modalBody').innerHTML = '';
+}
+
+function lockForm(form, locked) {
+  form.dataset.submitting = locked ? 'YES' : '';
+  Array.from(form.querySelectorAll('button, input, select, textarea')).forEach(el => el.disabled = locked);
+}
+
+function canAdminEdit() {
+  return Boolean(state.bootstrap && state.bootstrap.user && (state.bootstrap.user.canAdminEdit || state.bootstrap.user.canOwnerEdit));
+}
+
+function visibleNumber(record) {
+  return record && (record.displayNumber || record.poNumber || record.documentNumber || record.reqNumber || 'PO not assigned');
+}
+
+async function initialize() {
+  try {
+    busy('Loading PO Tracker...');
+    state.bootstrap = await callServer('poBootstrap');
+    renderSession();
+    idle();
+  } catch (error) {
+    fail(error);
+    $('#searchResults').innerHTML = `<article class="panel"><h3>Setup or access required</h3><p>${escapeHtml(error.message)}</p></article>`;
+  }
+}
+
+function renderSession() {
+  const b = state.bootstrap;
+  $('#environmentBadge').textContent = `${b.environment} · ${b.transactionMode}`;
+  $('#userLabel').textContent = `${b.user.name || b.user.email} · ${b.user.role}`;
+  $$('[data-capability="admin"]').forEach(el => el.hidden = !b.user.canAdminManage);
+  $$('[data-capability="owner"]').forEach(el => el.hidden = !b.user.canOwnerEdit);
+  $$('.admin-edit-only').forEach(el => el.hidden = !canAdminEdit());
+}
+
+function switchView(name) {
+  $$('.view').forEach(el => el.classList.toggle('active', el.id === `view-${name}`));
+  $$('.nav button').forEach(el => el.classList.toggle('active', el.dataset.view === name));
+  if (name === 'admin' && !state.admin) loadAdmin();
+  if (name === 'owner' && !state.owner) loadOwner();
+}
+
+async function runSearch(event) {
+  event.preventDefault();
+  const query = $('#searchInput').value.trim();
+  if (!query) return;
+  try {
+    busy('Searching...');
+    const result = await callServer('poSearch', query);
+    renderSearch(result.results);
+    $('#orderDetail').innerHTML = '';
+    idle();
+  } catch (error) {
+    fail(error);
+  }
+}
+
+function renderSearch(results) {
+  $('#searchResults').innerHTML = !results.length ? '<article class="panel">No matching procurement records.</article>' : results.map(item => `
+    <article class="result-card">
+      <div>
+        <h3>PO ${escapeHtml(visibleNumber(item))}</h3>
+        <div class="meta">${item.reqNumber ? `Req ${escapeHtml(item.reqNumber)} · ` : ''}${escapeHtml(item.documentType)} · ${escapeHtml(item.branchPlant || 'No branch')} · ${item.lines.length} line(s)</div>
+        <div class="meta">Ordered ${formatNumber(item.quantityOrdered)} · Open ${formatNumber(item.quantityOpen)} · Status <span class="status-${escapeHtml(item.status)}">${escapeHtml(item.status)}</span></div>
+      </div>
+      <button data-open-order="${escapeHtml(item.id)}">Open</button>
+    </article>`).join('');
+}
+
+async function openOrder(id) {
+  try {
+    busy('Loading order...');
+    state.currentDetail = await callServer('poDetail', id);
+    renderDetail();
+    idle();
+  } catch (error) {
+    fail(error);
+  }
+}
+
+function quantity(label, value) {
+  return `<div class="quantity"><strong>${formatNumber(value)}</strong><span>${escapeHtml(label)}</span></div>`;
+}
+
+function renderDetail() {
+  const d = state.currentDetail;
+  if (!d) return;
+  const editable = canAdminEdit();
+  const adminOrderActions = editable && d.lines.length
+    ? `<div class="button-row" style="margin-top:12px"><button data-edit-req="${escapeHtml(d.id)}">Edit Req / PO</button><button data-promised-order="${escapeHtml(d.id)}">Set promised date for req</button><button data-add-req-line="${escapeHtml(d.id)}">Add item</button><button class="danger" data-delete-req="${escapeHtml(d.id)}">Delete req</button></div>`
+    : '';
+  const reqMeta = d.reqNumber ? `Req ${escapeHtml(d.reqNumber)} · ` : '';
+  const poMeta = d.poNumbers && d.poNumbers.length > 1 ? `POs ${escapeHtml(d.poNumbers.join(', '))}` : `PO ${escapeHtml(d.poNumber || visibleNumber(d))}`;
+  const header = `
+    <article class="panel">
+      <p class="eyebrow">ORDER DETAIL</p>
+      <h2>${poMeta}</h2>
+      <p class="meta">${reqMeta}${escapeHtml(d.cloudDriveName || '')}</p>
+      <p class="meta">${escapeHtml(d.shipToAddress || 'No ship-to address')} · Requested ${formatDate(d.requestedDate)} · Imported delivery ${formatDate(d.importedDeliveryDate)}</p>
+      <div class="quantity-grid">${quantity('Ordered', d.quantityOrdered)}${quantity('Good received', d.quantityReceivedGood)}${quantity('Open', d.quantityOpen)}${quantity('Damaged', d.quantityDamaged)}${quantity('Incorrect', d.quantityIncorrect)}${quantity('Backordered', d.quantityVendorBackordered)}</div>
+      ${adminOrderActions}
+    </article>`;
+  const notePanel = renderNotesPanel(d);
+  const lines = d.lines.map(line => {
+    const fieldActions = state.bootstrap.user.canFieldTransact && line.quantityOpen > 0
+      ? `<button data-receive="HERE" data-line="${escapeHtml(line.id)}">Here</button><button data-receive="DAMAGED" data-line="${escapeHtml(line.id)}">Damaged</button><button data-receive="INCORRECT_ITEM" data-line="${escapeHtml(line.id)}">Incorrect item</button><button data-receive="NOT_HERE" data-line="${escapeHtml(line.id)}" ${line.canReportNotHere ? '' : 'disabled title="Available on or after the promised date"'}>Not here</button>`
+      : '';
+    const adminActions = editable
+      ? `<button data-promised="${escapeHtml(line.id)}">Set promised date</button>${line.quantityOpen > 0 ? `<button data-backorder="${escapeHtml(line.id)}">Confirm backorder</button>` : ''}`
+      : '';
+    const lineNumberMeta = line.reqNumber ? `Req ${escapeHtml(line.reqNumber)} · ` : '';
+    return `
+      <article class="line-card">
+        <div class="section-heading">
+          <div>
+            <h4>PO ${escapeHtml(line.poNumber || visibleNumber(d))} · line ${escapeHtml(line.lineNumber)} · ${escapeHtml(line.description)}</h4>
+            <div class="meta">${lineNumberMeta}${escapeHtml(line.uom)} · Job ${escapeHtml(line.jobNumber || '-')} · Account ${escapeHtml(line.accountNumber || '-')}${line.manualItem ? ' · Manual item' : ''}</div>
+          </div>
+          <div class="chip-row">
+            <span class="chip status-${escapeHtml(line.status)}">${escapeHtml(line.status)}</span>
+            ${line.quantityDamaged > 0 ? '<span class="chip status-DAMAGED">DAMAGED</span>' : ''}
+            ${line.quantityIncorrect > 0 ? '<span class="chip status-INCORRECT_ITEM">INCORRECT ITEM</span>' : ''}
+            ${line.quantityNotHere > 0 ? '<span class="chip status-OVERDUE">NOT HERE</span>' : ''}
+            ${line.quantityVendorBackordered > 0 ? '<span class="chip status-VENDOR_BACKORDER">VENDOR BACKORDER</span>' : ''}
+          </div>
+        </div>
+        <div class="quantity-grid">${quantity('Ordered', line.quantityOrdered)}${quantity('Good', line.quantityReceivedGood)}${quantity('Open', line.quantityOpen)}${quantity('Damaged', line.quantityDamaged)}${quantity('Incorrect', line.quantityIncorrect)}${quantity('Not here', line.quantityNotHere)}${quantity('Vendor BO', line.quantityVendorBackordered)}</div>
+        <div class="meta">Promised: ${formatDate(line.promisedDate)}</div>
+        <div class="button-row" style="margin-top:12px">${fieldActions}${adminActions}</div>
+      </article>`;
+  }).join('');
+  const docs = d.documents && d.documents.length ? `<article class="panel"><h3>Documents</h3>${d.documents.map(doc => `<a href="${escapeHtml(doc.url)}" target="_blank" rel="noopener">${escapeHtml(doc.role)} · ${escapeHtml(doc.fileName)}</a>`).join('<br>')}</article>` : '';
+  $('#orderDetail').innerHTML = header + notePanel + lines + docs;
+  $('#orderDetail').scrollIntoView({behavior: 'smooth', block: 'start'});
+}
+
+function renderNotesPanel(detail) {
+  const adminNotes = detail.adminNotes || [];
+  const fieldNotes = detail.fieldNotes || [];
+  const latestHeaderNote = detail.headerAdminNotes ? [{text: detail.headerAdminNotes, type: 'ADMIN_REQ'}] : [];
+  if (!adminNotes.length && !fieldNotes.length && !latestHeaderNote.length) return '';
+  const rows = [];
+  latestHeaderNote.forEach(note => rows.push(`<div class="list-row"><strong>Latest req note</strong><div>${escapeHtml(note.text)}</div></div>`));
+  const lineLabel = note => note.lineNumber ? ` · PO ${escapeHtml(note.poNumber || '-')} line ${escapeHtml(note.lineNumber)}` : '';
+  adminNotes.forEach(note => rows.push(`<div class="list-row"><strong>${escapeHtml(note.type || 'ADMIN_NOTE')}${lineLabel(note)}</strong><div>${escapeHtml(note.text)}</div>${note.description ? `<div class="meta">${escapeHtml(note.description)}</div>` : ''}<div class="meta">${formatDate(note.createdAt)} · ${escapeHtml(note.createdByName || note.createdByEmail || '')}</div></div>`));
+  fieldNotes.forEach(note => rows.push(`<div class="list-row"><strong>Field note · ${escapeHtml(note.type || '')}${lineLabel(note)}</strong><div>${escapeHtml(note.text)}</div>${note.description ? `<div class="meta">${escapeHtml(note.description)}</div>` : ''}<div class="meta">${formatDate(note.createdAt)} · ${escapeHtml(note.createdByName || note.createdByEmail || '')}</div></div>`));
+  return `<article class="panel"><details><summary><strong>Notes</strong> <span class="meta">${adminNotes.length + fieldNotes.length + latestHeaderNote.length} note(s)</span></summary><div class="compact-list">${rows.join('')}</div></details></article>`;
+}
+
+async function refreshCurrentDetailAndAdmin() {
+  if (state.currentDetail) {
+    state.currentDetail = await callServer('poDetail', state.currentDetail.id);
+    renderDetail();
+  }
+  if (state.admin) {
+    state.admin = await callServer('poAdminDashboard');
+    renderAdmin();
+  }
+}
+
+function receiveModal(action, lineId) {
+  const notesRequired = action !== 'HERE';
+  const requestKey = idempotency(action);
+  openModal(`<h3>${escapeHtml(action.replace('_', ' '))}</h3><form id="receiveForm" class="form-grid"><input id="receiveQuantity" type="number" min="0.001" step="any" placeholder="Quantity" required><textarea id="receiveNotes" placeholder="Notes${notesRequired ? ' (required)' : ''}" ${notesRequired ? 'required' : ''}></textarea><button class="primary">Confirm</button></form>`);
+  $('#receiveForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (form.dataset.submitting === 'YES') return;
+    try {
+      lockForm(form, true);
+      busy('Recording action...');
+      const result = await callServer('poReceive', {action, lineId, quantity: Number($('#receiveQuantity').value), notes: $('#receiveNotes').value, idempotencyKey: requestKey});
+      state.currentDetail = result.detail;
+      closeModal();
+      renderDetail();
+      idle();
+      toast(result.idempotentReplay ? 'Request was already recorded; showing current order.' : 'Material action recorded.');
+    } catch (error) {
+      lockForm(form, false);
+      fail(error);
+    }
+  });
+}
+
+function promisedModal(lineId) {
+  openModal(`<h3>Set promised date</h3><form id="promisedForm" class="form-grid"><input id="promisedDate" type="date" required><button class="primary">Save</button></form>`);
+  $('#promisedForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (form.dataset.submitting === 'YES') return;
+    try {
+      lockForm(form, true);
+      busy('Saving promised date...');
+      await callServer('poSavePromisedDates', [{lineId, promisedDate: $('#promisedDate').value}]);
+      await refreshCurrentDetailAndAdmin();
+      closeModal();
+      idle();
+      toast('Promised date updated.');
+    } catch (error) {
+      lockForm(form, false);
+      fail(error);
+    }
+  });
+}
+
+function promisedOrderModal(procurementId) {
+  const detail = state.currentDetail;
+  const lineIds = detail && detail.id === procurementId ? detail.lines.map(line => line.id) : [];
+  if (!lineIds.length) return toast('Open the requisition before applying a req promised date.', true);
+  openModal(`<h3>Set promised date for req</h3><p class="meta">Applies to ${lineIds.length} line(s) on ${escapeHtml(detail.documentNumber)}.</p><form id="promisedOrderForm" class="form-grid"><input id="promisedOrderDate" type="date" required><button class="primary">Apply to req</button></form>`);
+  $('#promisedOrderForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (form.dataset.submitting === 'YES') return;
+    try {
+      lockForm(form, true);
+      busy('Applying req promised date...');
+      const promisedDate = $('#promisedOrderDate').value;
+      const result = await callServer('poSaveReqPromisedDate', procurementId, promisedDate);
+      await refreshCurrentDetailAndAdmin();
+      closeModal();
+      idle();
+      toast(`Updated ${result.updatedCount || lineIds.length} promised date(s).`);
+    } catch (error) {
+      lockForm(form, false);
+      fail(error);
+    }
+  });
+}
+
+function backorderModal(lineId) {
+  const requestKey = idempotency('BO');
+  openModal(`<h3>Confirm vendor backorder</h3><form id="backorderForm" class="form-grid"><input id="boQuantity" type="number" min="0.001" step="any" placeholder="Quantity" required><input id="boVendor" placeholder="Vendor name" required><label>Vendor confirmation date<input id="boConfirmDate" type="date" required></label><label>Revised promised date<input id="boPromiseDate" type="date" required></label><input id="boReference" placeholder="Vendor reference (optional)"><textarea id="boNotes" placeholder="Admin notes (optional)"></textarea><button class="primary">Confirm backorder</button></form>`);
+  $('#backorderForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (form.dataset.submitting === 'YES') return;
+    try {
+      lockForm(form, true);
+      busy('Confirming backorder...');
+      const result = await callServer('poConfirmBackorder', {lineId, quantity: Number($('#boQuantity').value), vendorName: $('#boVendor').value, vendorConfirmationDate: $('#boConfirmDate').value, revisedPromisedDate: $('#boPromiseDate').value, vendorReference: $('#boReference').value, notes: $('#boNotes').value, idempotencyKey: requestKey});
+      state.currentDetail = result.detail;
+      closeModal();
+      renderDetail();
+      idle();
+      toast(result.idempotentReplay ? 'Backorder was already recorded; showing current order.' : 'Vendor backorder confirmed.');
+    } catch (error) {
+      lockForm(form, false);
+      fail(error);
+    }
+  });
+}
+
+async function loadAdmin() {
+  try {
+    busy('Loading admin dashboard...');
+    state.admin = await callServer('poAdminDashboard');
+    renderAdmin();
+    idle();
+    loadAdminDocuments(true);
+  } catch (error) {
+    fail(error);
+  }
+}
+
+function renderAdmin() {
+  const k = state.admin.kpis;
+  $('#adminKpis').innerHTML = Object.entries({Documents: k.documents, Lines: k.lines, Ordered: k.quantityOrdered, Received: k.quantityReceived, Open: k.quantityOpen, Overdue: k.overdue, Incorrect: k.incorrectItem}).map(([label, value]) => `<div class="kpi"><strong>${formatNumber(value)}</strong><span>${label}</span></div>`).join('');
+  const labels = {missingDate: 'Missing dates', dueToday: 'Due today', overdue: 'Overdue', damaged: 'Damaged', incorrectItem: 'Incorrect item', vendorBackorder: 'Vendor BO'};
+  $('#queueTabs').innerHTML = Object.entries(labels).map(([key, label]) => `<button class="chip" data-queue="${key}">${label} (${(state.admin.queues[key] || []).length})</button>`).join('');
+  renderQueue();
+}
+
+function renderQueue() {
+  const items = state.admin.queues[state.currentQueue] || [];
+  const bulk = state.currentQueue === 'missingDate' && items.length && canAdminEdit() ? `<div class="list-row"><strong>Bulk promised date</strong><div class="search-row"><input id="bulkPromisedDate" type="date"><button data-bulk-promised>Apply to selected</button></div></div>` : '';
+  $('#queueList').innerHTML = bulk + (items.length ? items.map(line => `
+    <div class="list-row">
+      ${state.currentQueue === 'missingDate' && canAdminEdit() ? `<label><input type="checkbox" data-bulk-line="${escapeHtml(line.id)}"> Select</label>` : ''}
+      <strong>PO ${escapeHtml(line.poNumber || line.documentNumber || '-')} · line ${escapeHtml(line.lineNumber)}</strong>
+      <div>${escapeHtml(line.description)}</div>
+      <div class="meta">${line.reqNumber ? `Req ${escapeHtml(line.reqNumber)} · ` : ''}Open ${formatNumber(line.quantityOpen)} ${escapeHtml(line.uom)} · promised ${formatDate(line.promisedDate)}</div>
+      <button data-open-line-order="${escapeHtml(line.procurementId)}">Open order</button>
+    </div>`).join('') : '<p class="meta">Queue is clear.</p>');
+}
+
+function resetAdminDocuments(query) {
+  state.adminDocuments = {items: [], nextCursor: '', query: normalizeQuery(query), loading: false};
+  state.adminDocumentErrors = {};
+  state.expandedAdminDocuments = {};
+  renderAdminDocuments();
+}
+
+function normalizeQuery(value) {
+  return String(value == null ? '' : value).trim();
+}
+
+async function loadAdminDocuments(reset = false) {
+  const input = $('#adminDocumentSearch');
+  const nextQuery = reset ? normalizeQuery(input && input.value) : state.adminDocuments.query;
+  if (reset) resetAdminDocuments(nextQuery);
+  if (state.adminDocuments.loading) return;
+  state.adminDocuments.loading = true;
+  renderAdminDocuments();
+  try {
+    const result = await callServer('poAdminDocuments', {
+      query: state.adminDocuments.query,
+      cursor: reset ? '' : state.adminDocuments.nextCursor,
+      pageSize: 20
+    });
+    state.adminDocuments.items = reset ? result.documents : state.adminDocuments.items.concat(result.documents);
+    state.adminDocuments.nextCursor = result.nextCursor || '';
+    state.adminDocuments.loading = false;
+    renderAdminDocuments();
+  } catch (error) {
+    state.adminDocuments.loading = false;
+    $('#adminDocumentsList').innerHTML = `<p class="error-text">Documents failed to load: ${escapeHtml(error.message || String(error))}</p>`;
+    $('#adminDocumentsPager').hidden = true;
+    fail(error);
+  }
+}
+
+function renderAdminDocuments() {
+  const list = $('#adminDocumentsList');
+  if (!list) return;
+  const docs = state.adminDocuments.items;
+  if (!docs.length && state.adminDocuments.loading) {
+    list.innerHTML = '<p class="meta">Loading documents...</p>';
+  } else if (!docs.length) {
+    list.innerHTML = '<p class="meta">No documents found.</p>';
+  } else {
+    list.innerHTML = docs.map(renderAdminDocumentCard).join('');
+  }
+  const pager = $('#adminDocumentsPager');
+  if (pager) pager.hidden = !state.adminDocuments.nextCursor || state.adminDocuments.loading;
+}
+
+function renderAdminDocumentCard(doc) {
+  const expanded = Boolean(state.expandedAdminDocuments[doc.id]);
+  const poLabel = doc.poNumbers && doc.poNumbers.length > 1 ? doc.poNumbers.join(', ') : (doc.poNumber || 'PO not assigned');
+  const noteChip = doc.hasNotes ? '<span class="chip">Notes</span>' : '';
+  const editorActions = canAdminEdit() ? `<button data-edit-req="${escapeHtml(doc.id)}">Edit Req / PO</button><button data-add-req-line="${escapeHtml(doc.id)}">Add item</button><button class="danger" data-delete-req="${escapeHtml(doc.id)}">Delete req</button>` : '';
+  return `
+    <div class="list-row document-row">
+      <div class="document-summary">
+        <div>
+          <strong>PO ${escapeHtml(poLabel)}</strong>
+          <div class="meta">Req ${escapeHtml(doc.reqNumber || doc.documentNumber || '-')} · ${escapeHtml(doc.cloudDriveName || '')}</div>
+          <div class="meta">${escapeHtml(doc.branchPlant || 'No branch')} · ${doc.totalLines} line(s) · Updated ${formatDate(doc.updatedAt)}</div>
+          <div class="chip-row document-chips">
+            <span class="chip status-${escapeHtml(doc.status)}">${escapeHtml(doc.status || 'OPEN')}</span>
+            <span class="chip">Open ${formatNumber(doc.quantityOpen)}</span>
+            ${noteChip}
+            ${doc.quantityDamaged > 0 ? `<span class="chip status-DAMAGED">Damaged ${formatNumber(doc.quantityDamaged)}</span>` : ''}
+            ${doc.quantityIncorrect > 0 ? `<span class="chip status-INCORRECT_ITEM">Incorrect ${formatNumber(doc.quantityIncorrect)}</span>` : ''}
+            ${doc.quantityNotHere > 0 ? `<span class="chip status-OVERDUE">Not here ${formatNumber(doc.quantityNotHere)}</span>` : ''}
+            ${doc.quantityVendorBackordered > 0 ? `<span class="chip status-VENDOR_BACKORDER">Vendor BO ${formatNumber(doc.quantityVendorBackordered)}</span>` : ''}
+          </div>
+        </div>
+        <div class="button-row">
+          <button data-toggle-admin-document="${escapeHtml(doc.id)}">${expanded ? 'Collapse' : 'Expand'}</button>
+          <button data-open-line-order="${escapeHtml(doc.id)}">Open order</button>
+          ${editorActions}
+        </div>
+      </div>
+      <div class="admin-document-detail" ${expanded ? '' : 'hidden'}>${renderAdminDocumentDetail(doc.id)}</div>
+    </div>`;
+}
+
+function renderAdminDocumentDetail(procurementId) {
+  if (state.adminDocumentErrors[procurementId]) return `<p class="error-text">${escapeHtml(state.adminDocumentErrors[procurementId])}</p>`;
+  const detail = state.adminDocumentDetails[procurementId];
+  if (!detail) return '<p class="meta">Loading line statuses...</p>';
+  const editor = canAdminEdit();
+  const rows = detail.lines.map(line => `
+    <tr>
+      ${editor ? `<td><input type="checkbox" data-admin-line-select="${escapeHtml(procurementId)}" value="${escapeHtml(line.id)}"></td>` : ''}
+      <td>${escapeHtml(line.lineNumber)}</td>
+      <td>${escapeHtml(line.poNumber || '-')}</td>
+      <td><span class="chip status-${escapeHtml(line.status)}">${escapeHtml(line.status)}</span></td>
+      <td>${escapeHtml(line.description)}${line.adminNotes ? `<div class="meta">Admin note: ${escapeHtml(line.adminNotes)}</div>` : ''}</td>
+      <td>${formatNumber(line.quantityOrdered)}</td>
+      <td>${formatNumber(line.quantityReceivedGood)}</td>
+      <td>${formatNumber(line.quantityOpen)}</td>
+      <td>${formatNumber(line.quantityDamaged)}</td>
+      <td>${formatNumber(line.quantityIncorrect)}</td>
+      <td>${formatNumber(line.quantityNotHere)}</td>
+      <td>${formatNumber(line.quantityVendorBackordered)}</td>
+      <td>${formatDate(line.promisedDate)}</td>
+    </tr>`).join('');
+  const notes = renderNotesPanel(detail);
+  const editorControls = editor ? `<div class="button-row" style="margin-top:10px"><button data-assign-selected-po="${escapeHtml(procurementId)}">Assign selected to PO</button><button data-add-selected-note="${escapeHtml(procurementId)}">Add note to selected</button><button class="danger" data-delete-selected-lines="${escapeHtml(procurementId)}">Delete selected items</button></div>` : '';
+  return `
+    ${editorControls}
+    <div class="table-wrap">
+      <table class="data-table document-lines-table">
+        <thead><tr>${editor ? '<th>Select</th>' : ''}<th>Line</th><th>PO</th><th>Status</th><th>Description</th><th>Ordered</th><th>Good</th><th>Open</th><th>Damaged</th><th>Incorrect</th><th>Not here</th><th>Vendor BO</th><th>Promised</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    ${notes}`;
+}
+
+async function toggleAdminDocument(procurementId) {
+  if (state.expandedAdminDocuments[procurementId]) {
+    delete state.expandedAdminDocuments[procurementId];
+    renderAdminDocuments();
+    return;
+  }
+  state.expandedAdminDocuments[procurementId] = true;
+  renderAdminDocuments();
+  if (state.adminDocumentDetails[procurementId]) return;
+  try {
+    state.adminDocumentDetails[procurementId] = await callServer('poDetail', procurementId);
+    delete state.adminDocumentErrors[procurementId];
+    renderAdminDocuments();
+  } catch (error) {
+    state.adminDocumentErrors[procurementId] = error.message || String(error);
+    renderAdminDocuments();
+    fail(error);
+  }
+}
+
+async function searchAdminDocuments(event) {
+  event.preventDefault();
+  await loadAdminDocuments(true);
+}
+
+async function clearAdminDocumentSearch() {
+  $('#adminDocumentSearch').value = '';
+  await loadAdminDocuments(true);
+}
+
+async function applyBulkPromised() {
+  const promisedDate = $('#bulkPromisedDate') && $('#bulkPromisedDate').value;
+  const lineIds = $$('[data-bulk-line]:checked').map(input => input.dataset.bulkLine);
+  if (!promisedDate || !lineIds.length) return toast('Choose a date and at least one line.', true);
+  try {
+    busy('Applying promised dates...');
+    await callServer('poSavePromisedDates', lineIds.map(lineId => ({lineId, promisedDate})));
+    await loadAdmin();
+    toast(`Updated ${lineIds.length} promised date(s).`);
+  } catch (error) {
+    fail(error);
+  }
+}
+
+function selectedAdminLineIds(procurementId) {
+  return $$('[data-admin-line-select]').filter(input => input.dataset.adminLineSelect === procurementId && input.checked).map(input => input.value);
+}
+
+async function getAdminDetail(procurementId) {
+  if (state.adminDocumentDetails[procurementId]) return state.adminDocumentDetails[procurementId];
+  const detail = await callServer('poDetail', procurementId);
+  state.adminDocumentDetails[procurementId] = detail;
+  return detail;
+}
+
+async function finishAdminEdit(detail, message) {
+  state.currentDetail = state.currentDetail && state.currentDetail.id === detail.id ? detail : state.currentDetail;
+  state.adminDocumentDetails[detail.id] = detail;
+  renderAdminDocuments();
+  if (state.currentDetail && state.currentDetail.id === detail.id) renderDetail();
+  state.admin = null;
+  await loadAdmin();
+  idle();
+  toast(message);
+}
+
+async function editReqModal(procurementId) {
+  try {
+    busy('Loading req...');
+    const detail = await getAdminDetail(procurementId);
+    idle();
+    openModal(`<h3>Edit Req / PO</h3><p class="meta">Use this when corporate changes the Req # or PO #. Check the box when one PO applies to every active item on the req.</p><form id="editReqForm" class="form-grid"><label>Req number<input id="editReqNumber" value="${escapeHtml(detail.reqNumber || detail.documentNumber || '')}" required></label><label>Primary PO number<input id="editPoNumber" value="${escapeHtml(detail.poNumber || '')}" required></label><label><input id="editPoApplyLines" type="checkbox" checked> Apply PO to all active items</label><button class="primary">Save identifiers</button></form>`);
+    $('#editReqForm').addEventListener('submit', async event => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      if (form.dataset.submitting === 'YES') return;
+      try {
+        lockForm(form, true);
+        busy('Saving Req / PO...');
+        const result = await callServer('poUpdateReqPoIdentifiers', {procurementId, reqNumber: $('#editReqNumber').value, primaryPoNumber: $('#editPoNumber').value, applyPoToLines: $('#editPoApplyLines').checked});
+        closeModal();
+        await finishAdminEdit(result, 'Req / PO identifiers updated.');
+      } catch (error) {
+        lockForm(form, false);
+        fail(error);
+      }
+    });
+  } catch (error) {
+    fail(error);
+  }
+}
+
+function assignSelectedPoModal(procurementId) {
+  const lineIds = selectedAdminLineIds(procurementId);
+  if (!lineIds.length) return toast('Select at least one item to assign to a PO.', true);
+  openModal(`<h3>Assign selected items to PO</h3><p class="meta">${lineIds.length} item(s) selected. This supports one req split across multiple POs.</p><form id="assignPoForm" class="form-grid"><input id="assignPoNumber" placeholder="PO number" required><textarea id="assignPoNotes" placeholder="Notes (optional)"></textarea><button class="primary">Assign to PO</button></form>`);
+  $('#assignPoForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (form.dataset.submitting === 'YES') return;
+    try {
+      lockForm(form, true);
+      busy('Assigning PO...');
+      const result = await callServer('poAssignLinesToPo', {procurementId, lineIds, poNumber: $('#assignPoNumber').value, notes: $('#assignPoNotes').value});
+      closeModal();
+      await finishAdminEdit(result, 'Selected items assigned to PO.');
+    } catch (error) {
+      lockForm(form, false);
+      fail(error);
+    }
+  });
+}
+
+function addReqLineModal(procurementId) {
+  openModal(`<h3>Add item to req</h3><form id="addReqLineForm" class="form-grid"><input id="addLineNumber" placeholder="Line number (blank = next)"><input id="addLinePo" placeholder="PO number (optional)"><input id="addLineQty" type="number" min="0.001" step="any" placeholder="Ordered quantity" required><input id="addLineUom" placeholder="UOM" required><textarea id="addLineDesc" placeholder="Description" required></textarea><input id="addLineJob" placeholder="Job number"><input id="addLineAccount" placeholder="Account number"><input id="addLineUnitPrice" type="number" min="0" step="any" placeholder="Unit price (optional)"><label>Promised date<input id="addLinePromised" type="date"></label><textarea id="addLineNotes" placeholder="Admin notes (optional)"></textarea><button class="primary">Add item</button></form>`);
+  $('#addReqLineForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (form.dataset.submitting === 'YES') return;
+    try {
+      lockForm(form, true);
+      busy('Adding item...');
+      const result = await callServer('poAddReqLine', {procurementId, lineNumber: $('#addLineNumber').value, poNumber: $('#addLinePo').value, quantityOrdered: Number($('#addLineQty').value), uom: $('#addLineUom').value, description: $('#addLineDesc').value, jobNumber: $('#addLineJob').value, accountNumber: $('#addLineAccount').value, unitPrice: Number($('#addLineUnitPrice').value || 0), promisedDate: $('#addLinePromised').value, adminNotes: $('#addLineNotes').value});
+      closeModal();
+      await finishAdminEdit(result, 'Item added to req.');
+    } catch (error) {
+      lockForm(form, false);
+      fail(error);
+    }
+  });
+}
+
+function deleteSelectedLinesModal(procurementId) {
+  const lineIds = selectedAdminLineIds(procurementId);
+  if (!lineIds.length) return toast('Select at least one item to delete.', true);
+  openModal(`<h3>Delete selected items</h3><p class="error-text">This is a soft-delete. Items with field activity, damage, or backorders are blocked.</p><form id="deleteLinesForm" class="form-grid"><textarea id="deleteLinesReason" placeholder="Reason" required></textarea><button class="danger">Delete selected items</button></form>`);
+  $('#deleteLinesForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (form.dataset.submitting === 'YES') return;
+    try {
+      lockForm(form, true);
+      busy('Deleting selected items...');
+      const result = await callServer('poDeleteReqLines', {procurementId, lineIds, reason: $('#deleteLinesReason').value});
+      closeModal();
+      await finishAdminEdit(result, 'Selected items deleted.');
+    } catch (error) {
+      lockForm(form, false);
+      fail(error);
+    }
+  });
+}
+
+function deleteReqModal(procurementId) {
+  openModal(`<h3>Delete entire req</h3><p class="error-text">This soft-deletes the req and all active, untransacted items. Reqs with field activity are blocked.</p><form id="deleteReqForm" class="form-grid"><textarea id="deleteReqReason" placeholder="Reason" required></textarea><button class="danger">Delete req</button></form>`);
+  $('#deleteReqForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (form.dataset.submitting === 'YES') return;
+    try {
+      lockForm(form, true);
+      busy('Deleting req...');
+      const result = await callServer('poDeleteReq', {procurementId, reason: $('#deleteReqReason').value});
+      closeModal();
+      state.currentDetail = null;
+      $('#orderDetail').innerHTML = '';
+      state.admin = null;
+      await loadAdmin();
+      idle();
+      toast(`Req deleted with ${result.deletedLineCount || 0} item(s).`);
+    } catch (error) {
+      lockForm(form, false);
+      fail(error);
+    }
+  });
+}
+
+function addSelectedLineNoteModal(procurementId) {
+  const lineIds = selectedAdminLineIds(procurementId);
+  if (!lineIds.length) return toast('Select at least one line item before adding a note.', true);
+  openModal(`<h3>Add note to selected item(s)</h3><p class="meta">${lineIds.length} selected line item(s). The note will be tied to each selected line.</p><form id="addLineNoteForm" class="form-grid"><textarea id="addLineNoteText" placeholder="Admin line note" required></textarea><button class="primary">Add line note</button></form>`);
+  $('#addLineNoteForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (form.dataset.submitting === 'YES') return;
+    try {
+      lockForm(form, true);
+      busy('Adding note...');
+      const result = await callServer('poAddReqNote', {procurementId, lineIds, noteText: $('#addLineNoteText').value});
+      closeModal();
+      await finishAdminEdit(result, `Line note added to ${lineIds.length} item(s).`);
+    } catch (error) {
+      lockForm(form, false);
+      fail(error);
+    }
+  });
+}
+
+function clearImportFiles() {
+  const input = $('#importFiles');
+  if (input) input.value = '';
+  $('#importProgress').textContent = '';
+  state.currentImportBatchId = '';
+  toast('Selected import files cleared.');
+}
+
+async function startImport() {
+  const files = Array.from($('#importFiles').files || []);
+  if (!files.length) return toast('Choose one or more .xls/.xlsx files.', true);
+  if (files.some(file => file.size > 8 * 1024 * 1024)) return toast('Each file must be 8 MB or smaller.', true);
+  try {
+    busy('Creating import batch...');
+    $('#importProgress').textContent = 'Preparing import batch...';
+    const batch = await callServer('poCreateImportBatch', $('#importNotes').value);
+    state.currentImportBatchId = batch.batchId;
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      $('#importProgress').textContent = `Uploading ${index + 1} of ${files.length}: ${file.name}`;
+      const data = await readFileBase64(file);
+      await callServer('poUploadImportFile', {batchId: batch.batchId, fileName: file.name, mimeType: file.type || mimeFor(file.name), sizeBytes: file.size, base64Data: data, modifiedAt: new Date(file.lastModified).toISOString()});
+    }
+    const review = await callServer('poImportBatch', batch.batchId);
+    renderImportReview(review);
+    $('#importFiles').value = '';
+    idle();
+    toast('Import batch staged for review.');
+  } catch (error) {
+    $('#importProgress').innerHTML = `<p class="error-text">Upload failed: ${escapeHtml(error.message || String(error))}</p>`;
+    fail(error);
+  }
+}
+
+function readFileBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () => resolve(String(reader.result).split(',')[1]);
+    reader.readAsDataURL(file);
+  });
+}
+
+function mimeFor(name) {
+  return name.toLowerCase().endsWith('.xls') ? 'application/vnd.ms-excel' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+}
+
+function renderImportReview(batch) {
+  state.currentImportBatchId = batch.batchId;
+  $('#importProgress').innerHTML = `<p><strong>Batch ${escapeHtml(batch.batchId)}</strong> · ${batch.totalLineCount} line(s) · ${batch.status}</p>${batch.documents.map(doc => `
+    <div class="list-row">
+      <strong>${escapeHtml(doc.fileName)}</strong>
+      <div>${escapeHtml(doc.documentNumber || 'No document')} · ${doc.lineCount} lines · ${escapeHtml(doc.status)}</div>
+      ${doc.diff && doc.diff.revision ? `<div class="meta">Revision diff: ${doc.diff.added} added · ${doc.diff.changed} changed · ${doc.diff.removed} removed</div>` : ''}
+      ${doc.validationErrors ? `<div class="meta">${escapeHtml(doc.validationErrors)}</div>` : ''}
+      <div class="button-row" style="margin-top:8px">
+        <button data-review-staging="${escapeHtml(doc.id)}">Review parsed data</button>
+        <button data-publish="${escapeHtml(doc.id)}" ${doc.errorCount ? 'disabled' : ''}>Publish${doc.warningCount ? ' with warning approval' : ''}</button>
+      </div>
+    </div>`).join('')}`;
+}
+
+async function reviewStaging(id) {
+  try {
+    busy('Loading parsed requisition...');
+    const detail = await callServer('poStagingDetail', id);
+    renderStagingDetail(detail);
+    idle();
+  } catch (error) {
+    fail(error);
+  }
+}
+
+function renderStagingDetail(detail) {
+  const doc = detail.document;
+  const issues = detail.issues.length ? `<h4>Import issues</h4>${detail.issues.map(issue => `<div class="list-row"><strong>${escapeHtml(issue.severity)} · ${escapeHtml(issue.code)}</strong><div>${escapeHtml(issue.message)}</div><div class="meta">${escapeHtml(issue.fieldName)} ${escapeHtml(issue.lineNumber || '')}</div></div>`).join('')}` : '';
+  const rows = detail.lines.map(line => `
+    <tr>
+      <td>${escapeHtml(line.lineNumber)}</td>
+      <td>${formatNumber(line.quantityOrdered)}</td>
+      <td>${escapeHtml(line.uom)}</td>
+      <td>${escapeHtml(line.description)}</td>
+      <td>${escapeHtml(line.accountNumber || line.objectAccount || '-')}</td>
+      <td>${escapeHtml(line.jobNumber || '-')}</td>
+      <td>${formatDate(line.requestDate)}</td>
+      <td>${formatNumber(line.unitPrice)}</td>
+      <td>${formatNumber(line.extendedPrice)}</td>
+      <td>${escapeHtml(line.status)}</td>
+    </tr>`).join('');
+  openModal(`
+    <h3>Parsed requisition ${escapeHtml(doc.documentNumber || '')}</h3>
+    <p class="meta">${escapeHtml(doc.fileName)} · ${doc.lineCount} line(s) · ${escapeHtml(doc.status)}</p>
+    ${doc.diff && doc.diff.revision ? `<p class="meta">Revision diff: ${doc.diff.added} added · ${doc.diff.changed} changed · ${doc.diff.removed} removed</p>` : ''}
+    ${issues}
+    <div class="table-wrap">
+      <table class="data-table">
+        <thead><tr><th>Line</th><th>Qty</th><th>UOM</th><th>Description</th><th>Account</th><th>Job</th><th>Request</th><th>Unit</th><th>Ext</th><th>Status</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`);
+}
+
+async function publishStaging(id, allowWarnings, button) {
+  try {
+    if (button) button.disabled = true;
+    busy('Publishing staged document...');
+    $('#importProgress').insertAdjacentHTML('afterbegin', '<p class="meta">Publishing staged document. This can take a moment on larger requisitions.</p>');
+    const result = await callServer('poPublishStaging', id, allowWarnings);
+    if (state.currentImportBatchId) renderImportReview(await callServer('poImportBatch', state.currentImportBatchId));
+    idle();
+    toast(result.alreadyPublished ? 'Document was already published.' : `Document published with ${result.lineCount || 0} line(s).`);
+    await loadAdmin();
+  } catch (error) {
+    if (button) button.disabled = false;
+    fail(error);
+  }
+}
+
+async function loadOwner() {
+  try {
+    busy('Loading owner controls...');
+    state.owner = await callServer('poSystemControl');
+    renderOwner();
+    idle();
+  } catch (error) {
+    fail(error);
+  }
+}
+
+function renderOwner() {
+  $('#configurationList').innerHTML = state.owner.configuration.map(item => `<div class="list-row"><strong>${escapeHtml(item.setting)}</strong><div class="meta">${escapeHtml(item.description || '')}</div>${item.editable ? `<div class="search-row"><input data-setting-value="${escapeHtml(item.setting)}" value="${escapeHtml(item.value)}"><button data-save-setting="${escapeHtml(item.setting)}">Save</button></div>` : `<div>${escapeHtml(item.value)}</div>`}</div>`).join('');
+  $('#userList').innerHTML = state.owner.users.map(user => `<div class="list-row"><strong>${escapeHtml(user.name || user.email)}</strong><div>${escapeHtml(user.email)} · ${escapeHtml(user.role)} · ${user.active ? 'Active' : 'Inactive'}</div><div class="meta">Admin dashboard: ${user.canAdminManage ? 'Yes' : 'No'} · Admin edit: ${user.canAdminEdit ? 'Yes' : 'No'}</div></div>`).join('');
+  const fieldTransactions = state.owner.recentFieldTransactions || [];
+  $('#ownerTransactions').innerHTML = fieldTransactions.length ? fieldTransactions.map(tx => `
+    <div class="list-row">
+      <strong>${escapeHtml(tx.documentNumber)} · ${escapeHtml(tx.transactionType)} · ${formatNumber(tx.quantity)} ${escapeHtml(tx.uom)}</strong>
+      <div class="meta">${formatDate(tx.eventAt)} · ${escapeHtml(tx.performedByName || tx.performedByEmail)} · ${escapeHtml(tx.notes || 'No notes')}</div>
+      <button data-correct-transaction="${escapeHtml(tx.id)}" ${tx.canCorrect ? '' : `disabled title="${escapeHtml(tx.correctionBlockedReason)}"`}>Correct</button>
+    </div>`).join('') : '<p class="meta">No field actions have been recorded yet.</p>';
+  $('#correctionHistory').innerHTML = (state.owner.corrections || []).length ? state.owner.corrections.map(correction => `
+    <div class="list-row">
+      <strong>${escapeHtml(correction.documentNumber)} · ${escapeHtml(correction.status)}</strong>
+      <div class="meta">${escapeHtml(correction.reason || '')}</div>
+      <div class="meta">Target ${escapeHtml(correction.targetTransactionId)}${correction.reversalTransactionId ? ' · Reversal ' + escapeHtml(correction.reversalTransactionId) : ''}</div>
+    </div>`).join('') : '<p class="meta">No corrections have been previewed yet.</p>';
+  $('#deletionHistory').innerHTML = (state.owner.deletions || []).length ? state.owner.deletions.map(item => `
+    <div class="list-row">
+      <strong>${escapeHtml(item.entityType)} · Req ${escapeHtml(item.reqNumber || item.documentNumber || '-')} · PO ${escapeHtml(item.poNumber || '-')}</strong>
+      <div class="meta">${item.lineNumber ? 'Line ' + escapeHtml(item.lineNumber) + ' · ' : ''}${formatDate(item.deletedAt)} · ${escapeHtml(item.deletedByName || item.deletedByEmail || '')}</div>
+      <div>${escapeHtml(item.reason || '')}</div>
+    </div>`).join('') : '<p class="meta">No records have been deleted yet.</p>';
+}
+
+function selectCorrectionTransaction(id) {
+  $('#correctionTransaction').value = id;
+  $('#correctionReason').focus();
+  toast('Transaction selected for correction preview.');
+}
+
+async function saveSetting(setting) {
+  const input = document.querySelector(`[data-setting-value="${CSS.escape(setting)}"]`);
+  try {
+    busy('Saving configuration...');
+    state.bootstrap = await callServer('poSaveConfiguration', [{setting, value: input.value}]);
+    renderSession();
+    state.owner = null;
+    await loadOwner();
+    toast('Configuration saved.');
+  } catch (error) {
+    fail(error);
+  }
+}
+
+async function saveUser(event) {
+  event.preventDefault();
+  try {
+    busy('Saving user...');
+    await callServer('poSaveSystemUser', {email: $('#userEmail').value, displayName: $('#userName').value, profile: $('#userProfile').value, active: $('#userActive').checked, notes: $('#userNotes').value});
+    event.target.reset();
+    $('#userActive').checked = true;
+    state.owner = null;
+    await loadOwner();
+    toast('User saved.');
+  } catch (error) {
+    fail(error);
+  }
+}
+
+async function createBackup() {
+  try {
+    busy('Creating backup...');
+    const result = await callServer('poCreateBackup', 'Manual backup from Owner interface.');
+    idle();
+    toast(`Backup completed: ${result.fileName}`);
+  } catch (error) {
+    fail(error);
+  }
+}
+
+async function runHealth() {
+  try {
+    busy('Running diagnostics...');
+    const result = await callServer('poRunHealth');
+    $('#healthResult').textContent = JSON.stringify(result, null, 2);
+    idle();
+    toast(`Health check: ${result.status}`);
+  } catch (error) {
+    fail(error);
+  }
+}
+
+async function migrateSchema() {
+  try {
+    busy('Migrating schema...');
+    const result = await callServer('poMigrateSchema');
+    $('#healthResult').textContent = JSON.stringify(result, null, 2);
+    state.owner = null;
+    await loadOwner();
+    idle();
+    toast('Schema migration complete.');
+  } catch (error) {
+    fail(error);
+  }
+}
+
+async function previewCorrection() {
+  try {
+    busy('Building correction preview...');
+    const preview = await callServer('poPreviewCorrection', $('#correctionTransaction').value, $('#correctionReason').value);
+    $('#correctionPreview').innerHTML = `<div class="list-row"><strong>Verification: ${escapeHtml(preview.verificationCode)}</strong><p>${escapeHtml(preview.warning)}</p><button class="danger" data-apply-correction="${escapeHtml(preview.correctionId)}" data-code="${escapeHtml(preview.verificationCode)}">Apply compensating correction</button></div>`;
+    state.owner = null;
+    await loadOwner();
+    idle();
+  } catch (error) {
+    fail(error);
+  }
+}
+
+async function applyCorrection(id, code) {
+  if (!window.confirm('Apply this compensating correction? A backup will be created first.')) return;
+  try {
+    busy('Backing up and applying correction...');
+    await callServer('poApplyCorrection', id, code);
+    $('#correctionPreview').innerHTML = '';
+    state.owner = null;
+    await loadOwner();
+    idle();
+    toast('Compensating correction applied.');
+  } catch (error) {
+    fail(error);
+  }
+}
+
+document.addEventListener('click', event => {
+  const target = event.target.closest('button');
+  if (!target) return;
+  if (target.dataset.view) switchView(target.dataset.view);
+  if (target.dataset.openOrder) openOrder(target.dataset.openOrder);
+  if (target.dataset.openLineOrder) { switchView('field'); openOrder(target.dataset.openLineOrder); }
+  if (target.dataset.receive) receiveModal(target.dataset.receive, target.dataset.line);
+  if (target.dataset.promised) promisedModal(target.dataset.promised);
+  if (target.dataset.promisedOrder) promisedOrderModal(target.dataset.promisedOrder);
+  if (target.dataset.backorder) backorderModal(target.dataset.backorder);
+  if (target.dataset.queue) { state.currentQueue = target.dataset.queue; renderQueue(); }
+  if (Object.prototype.hasOwnProperty.call(target.dataset, 'bulkPromised')) applyBulkPromised();
+  if (target.dataset.toggleAdminDocument) toggleAdminDocument(target.dataset.toggleAdminDocument);
+  if (target.dataset.editReq) editReqModal(target.dataset.editReq);
+  if (target.dataset.assignSelectedPo) assignSelectedPoModal(target.dataset.assignSelectedPo);
+  if (target.dataset.addReqLine) addReqLineModal(target.dataset.addReqLine);
+  if (target.dataset.deleteSelectedLines) deleteSelectedLinesModal(target.dataset.deleteSelectedLines);
+  if (target.dataset.deleteReq) deleteReqModal(target.dataset.deleteReq);
+  if (target.dataset.addSelectedNote) addSelectedLineNoteModal(target.dataset.addSelectedNote);
+  if (target.dataset.reviewStaging) reviewStaging(target.dataset.reviewStaging);
+  if (target.dataset.publish) publishStaging(target.dataset.publish, true, target);
+  if (target.dataset.saveSetting) saveSetting(target.dataset.saveSetting);
+  if (target.dataset.correctTransaction) selectCorrectionTransaction(target.dataset.correctTransaction);
+  if (target.dataset.applyCorrection) applyCorrection(target.dataset.applyCorrection, target.dataset.code);
+});
+
+$('#searchForm').addEventListener('submit', runSearch);
+$('#closeModal').addEventListener('click', closeModal);
+$('#modal').addEventListener('click', event => { if (event.target.id === 'modal') closeModal(); });
+$('#refreshAdmin').addEventListener('click', loadAdmin);
+$('#refreshAdminDocuments').addEventListener('click', () => loadAdminDocuments(true));
+$('#adminDocumentSearchForm').addEventListener('submit', searchAdminDocuments);
+$('#clearAdminDocumentSearch').addEventListener('click', clearAdminDocumentSearch);
+$('#loadMoreAdminDocuments').addEventListener('click', () => loadAdminDocuments(false));
+$('#startImport').addEventListener('click', startImport);
+$('#clearImportFiles').addEventListener('click', clearImportFiles);
+$('#refreshOwner').addEventListener('click', loadOwner);
+$('#userForm').addEventListener('submit', saveUser);
+$('#createBackup').addEventListener('click', createBackup);
+$('#migrateSchema').addEventListener('click', migrateSchema);
+$('#runHealth').addEventListener('click', runHealth);
+$('#previewCorrection').addEventListener('click', previewCorrection);
+initialize();
+</script>
