@@ -844,42 +844,161 @@ function confirmVendorBackorderPoV1_(userEmail, request) {
 
 function getAdminDashboardPoV1_(userEmail) {
   const user = assertAdminUserPoV1_(userEmail);
-  const lines = getUsedRowsPoV1_(PO_V1.SHEETS.LINES).filter(function (line) { return yesPoV1_(line.Active); });
-  const lineByRow = {};
-  lines.forEach(function (line) { lineByRow[line._rowNumber] = line; });
-  const queues = {missingDate: [], dueToday: [], overdue: [], damaged: [], incorrectItem: [], vendorBackorder: []};
-  const keyToQueue = {MISSING_PROMISED_DATE: 'missingDate', DAMAGED: 'damaged', INCORRECT_ITEM: 'incorrectItem', VENDOR_BACKORDER: 'vendorBackorder'};
+
+  /*
+   * KPI totals are already maintained on Procurement_Header by
+   * recalculateProcurementPoV1_(). Use those canonical aggregates instead of
+   * loading every active Procurement_Line_Items row on every Admin dashboard load.
+   */
+  const headers = getUsedRowsPoV1_(PO_V1.SHEETS.HEADERS)
+    .filter(function (header) {
+      return yesPoV1_(header.Active);
+    });
+
+  /*
+   * Operational_Index tells us exactly which line rows are needed for the
+   * dashboard queues. Build lightweight row references first, then batch-read
+   * only those Procurement_Line_Items rows.
+   */
+  const queueRefs = {
+    missingDate: [],
+    dueToday: [],
+    overdue: [],
+    damaged: [],
+    incorrectItem: [],
+    vendorBackorder: []
+  };
+
+  const keyToQueue = {
+    MISSING_PROMISED_DATE: 'missingDate',
+    DAMAGED: 'damaged',
+    INCORRECT_ITEM: 'incorrectItem',
+    VENDOR_BACKORDER: 'vendorBackorder'
+  };
+
   const seen = {};
-  getUsedRowsPoV1_(PO_V1.SHEETS.OPERATIONAL_INDEX).filter(function (row) {
-    return yesPoV1_(row.Active) && (keyToQueue[normalizeUpperPoV1_(row.Index_Key)] || normalizeUpperPoV1_(row.Index_Type) === 'PROMISED_DATE');
-  }).forEach(function (indexRow) {
-    let queue = keyToQueue[normalizeUpperPoV1_(indexRow.Index_Key)];
-    if (normalizeUpperPoV1_(indexRow.Index_Type) === 'PROMISED_DATE') {
-      const promised = normalizePoV1_(indexRow.Index_Key).replace(/^PROMISED_DATE:/i, '');
-      queue = promised < todayKeyPoV1_() ? 'overdue' : (promised === todayKeyPoV1_() ? 'dueToday' : '');
-    }
-    if (!queue) return;
-    const entityId = normalizePoV1_(indexRow.Entity_ID);
-    const dedupeKey = queue + ':' + entityId;
-    if (seen[dedupeKey]) return;
-    seen[dedupeKey] = true;
-    const line = lineByRow[numberPoV1_(indexRow.Row_Number)];
-    if (line && yesPoV1_(line.Active) && normalizePoV1_(line.Procurement_Line_ID) === entityId) queues[queue].push(serializeLinePoV1_(line, user));
+  const requiredLineRows = {};
+
+  getUsedRowsPoV1_(PO_V1.SHEETS.OPERATIONAL_INDEX)
+    .filter(function (row) {
+      return yesPoV1_(row.Active) &&
+        (
+          keyToQueue[normalizeUpperPoV1_(row.Index_Key)] ||
+          normalizeUpperPoV1_(row.Index_Type) === 'PROMISED_DATE'
+        );
+    })
+    .forEach(function (indexRow) {
+      let queue = keyToQueue[normalizeUpperPoV1_(indexRow.Index_Key)];
+
+      if (normalizeUpperPoV1_(indexRow.Index_Type) === 'PROMISED_DATE') {
+        const promised = normalizePoV1_(indexRow.Index_Key)
+          .replace(/^PROMISED_DATE:/i, '');
+
+        queue = promised < todayKeyPoV1_()
+          ? 'overdue'
+          : (promised === todayKeyPoV1_() ? 'dueToday' : '');
+      }
+
+      if (!queue) return;
+
+      const entityId = normalizePoV1_(indexRow.Entity_ID);
+      const rowNumber = numberPoV1_(indexRow.Row_Number);
+      const dedupeKey = queue + ':' + entityId;
+
+      if (!entityId || rowNumber < 2 || seen[dedupeKey]) return;
+
+      seen[dedupeKey] = true;
+      requiredLineRows[rowNumber] = true;
+
+      queueRefs[queue].push({
+        entityId: entityId,
+        rowNumber: rowNumber
+      });
+    });
+
+  const lineRowNumbers = Object.keys(requiredLineRows)
+    .map(function (rowNumber) {
+      return Number(rowNumber);
+    })
+    .filter(function (rowNumber) {
+      return Number.isFinite(rowNumber) && rowNumber >= 2;
+    })
+    .sort(function (left, right) {
+      return left - right;
+    });
+
+  const lineByRow = {};
+
+  readRowObjectsPoV1_(
+    PO_V1.SHEETS.LINES,
+    lineRowNumbers
+  ).forEach(function (line) {
+    lineByRow[line._rowNumber] = line;
   });
+
+  const queues = {
+    missingDate: [],
+    dueToday: [],
+    overdue: [],
+    damaged: [],
+    incorrectItem: [],
+    vendorBackorder: []
+  };
+
+  Object.keys(queueRefs).forEach(function (queue) {
+    queueRefs[queue].forEach(function (reference) {
+      const line = lineByRow[reference.rowNumber];
+
+      if (
+        line &&
+        yesPoV1_(line.Active) &&
+        normalizePoV1_(line.Procurement_Line_ID) === reference.entityId
+      ) {
+        queues[queue].push(
+          serializeLinePoV1_(line, user)
+        );
+      }
+    });
+  });
+
   const queueCounts = {};
-  Object.keys(queues).forEach(function (key) { queueCounts[key] = queues[key].length; queues[key] = queues[key].slice(0, 200); });
+
+  Object.keys(queues).forEach(function (key) {
+    queueCounts[key] = queues[key].length;
+    queues[key] = queues[key].slice(0, 200);
+  });
+
+  const totals = headers.reduce(function (result, header) {
+    result.lines += numberPoV1_(header.Total_Lines);
+    result.quantityOrdered += numberPoV1_(header.Qty_Ordered);
+    result.quantityReceived += numberPoV1_(header.Qty_Received_Good);
+    result.quantityOpen += numberPoV1_(header.Qty_Open);
+    return result;
+  }, {
+    lines: 0,
+    quantityOrdered: 0,
+    quantityReceived: 0,
+    quantityOpen: 0
+  });
+
   return {
     user: user,
+
     kpis: {
-      documents: getUsedRowsPoV1_(PO_V1.SHEETS.HEADERS).filter(function (row) { return yesPoV1_(row.Active); }).length,
-      lines: lines.length,
-      quantityOrdered: lines.reduce(function (sum, line) { return sum + numberPoV1_(line.Qty_Ordered); }, 0),
-      quantityReceived: lines.reduce(function (sum, line) { return sum + numberPoV1_(line.Qty_Received_Good); }, 0),
-      quantityOpen: lines.reduce(function (sum, line) { return sum + numberPoV1_(line.Qty_Open); }, 0),
-      missingPromisedDate: queueCounts.missingDate, overdue: queueCounts.overdue, damaged: queueCounts.damaged,
-      incorrectItem: queueCounts.incorrectItem, vendorBackorder: queueCounts.vendorBackorder
+      documents: headers.length,
+      lines: totals.lines,
+      quantityOrdered: totals.quantityOrdered,
+      quantityReceived: totals.quantityReceived,
+      quantityOpen: totals.quantityOpen,
+      missingPromisedDate: queueCounts.missingDate,
+      overdue: queueCounts.overdue,
+      damaged: queueCounts.damaged,
+      incorrectItem: queueCounts.incorrectItem,
+      vendorBackorder: queueCounts.vendorBackorder
     },
+
     queues: queues,
+
     recentImports: getRecentImportBatchesPoV1_(10)
   };
 }
