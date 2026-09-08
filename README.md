@@ -59,6 +59,18 @@ Admin Edit users can:
 
 Deleted records are not physically removed from the workbook. They are marked inactive and audited so System Owners can see who deleted what and why.
 
+## Line note history
+
+PO Tracker loads note history only when procurement detail is opened.
+
+- Admin line notes are stored in `Procurement_Notes` and remain tied to `Procurement_Line_ID`.
+- Field note history is primarily sourced from `Material_Transactions`.
+- `Delivery_Exceptions` is used only as a legacy fallback when an exception note does not have a matching Field transaction note.
+- This prevents damaged, not-here, and incorrect-item comments from appearing twice.
+- Notes are grouped by line, sorted newest-first, and the detail payload returns a maximum of 20 notes per line.
+- Request-level `Admin_Notes` remain separate from line-level note history.
+- Search and collapsed Admin document lists do not hydrate line-note history; notes are loaded on demand with procurement detail.
+
 ## Core data model
 
 The database is a Google Sheets workbook with strict tabs for:

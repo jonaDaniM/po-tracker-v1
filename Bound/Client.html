@@ -122,7 +122,7 @@
       <article class="result-card">
         <div>
           <h3>PO ${escapeHtml(visibleNumber(item))}</h3>
-          <div class="meta">${item.reqNumber ? `Req ${escapeHtml(item.reqNumber)} · ` : ''}${escapeHtml(item.documentType)} · ${escapeHtml(item.branchPlant || 'No branch')} · ${formatNumber (item.totalLines)} lines(s)</div>
+          <div class="meta">${item.reqNumber ? `Req ${escapeHtml(item.reqNumber)} · ` : ''}${escapeHtml(item.documentType)} · ${escapeHtml(item.branchPlant || 'No branch')} · ${formatNumber(item.totalLines)} line(s)</div>
           <div class="meta">Ordered ${formatNumber(item.quantityOrdered)} · Open ${formatNumber(item.quantityOpen)} · Status <span class="status-${escapeHtml(item.status)}">${escapeHtml(item.status)}</span></div>
         </div>
         <button data-open-order="${escapeHtml(item.id)}">Open</button>
@@ -251,19 +251,7 @@
   }
   
   
-  function renderNotesPanel(detail) {
-    const adminNotes = detail.adminNotes || [];
-    const fieldNotes = detail.fieldNotes || [];
-    const latestHeaderNote = detail.headerAdminNotes ? [{text: detail.headerAdminNotes, type: 'ADMIN_REQ'}] : [];
-    if (!adminNotes.length && !fieldNotes.length && !latestHeaderNote.length) return '';
-    const rows = [];
-    latestHeaderNote.forEach(note => rows.push(`<div class="list-row"><strong>Latest req note</strong><div>${escapeHtml(note.text)}</div></div>`));
-    const lineLabel = note => note.lineNumber ? ` · PO ${escapeHtml(note.poNumber || '-')} line ${escapeHtml(note.lineNumber)}` : '';
-    adminNotes.forEach(note => rows.push(`<div class="list-row"><strong>${escapeHtml(note.type || 'ADMIN_NOTE')}${lineLabel(note)}</strong><div>${escapeHtml(note.text)}</div>${note.description ? `<div class="meta">${escapeHtml(note.description)}</div>` : ''}<div class="meta">${formatDate(note.createdAt)} · ${escapeHtml(note.createdByName || note.createdByEmail || '')}</div></div>`));
-    fieldNotes.forEach(note => rows.push(`<div class="list-row"><strong>Field note · ${escapeHtml(note.type || '')}${lineLabel(note)}</strong><div>${escapeHtml(note.text)}</div>${note.description ? `<div class="meta">${escapeHtml(note.description)}</div>` : ''}<div class="meta">${formatDate(note.createdAt)} · ${escapeHtml(note.createdByName || note.createdByEmail || '')}</div></div>`));
-    return `<article class="panel"><details><summary><strong>Notes</strong> <span class="meta">${adminNotes.length + fieldNotes.length + latestHeaderNote.length} note(s)</span></summary><div class="compact-list">${rows.join('')}</div></details></article>`;
-  }
-  
+    
   async function refreshCurrentDetailAndAdmin() {
     if (state.currentDetail) {
       state.currentDetail = await callServer('poDetail', state.currentDetail.id);

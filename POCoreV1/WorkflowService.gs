@@ -154,11 +154,6 @@ function serializeLinePoV1_(line, user) {
   };
 }
 
-function noteLineContextPoV1_(lineById, lineId) {
-  const line = lineById[normalizePoV1_(lineId)];
-  if (!line) return {lineNumber: '', poNumber: '', description: ''};
-  return {lineNumber: line.Line_Number, poNumber: poNumberPoV1_(line), description: line.Material_Description};
-}
 
 const PO_V1_LINE_NOTE_POLICY = Object.freeze({
   MAX_NOTES_PER_LINE: 20
@@ -306,24 +301,6 @@ function mergeLineNotesPoV1_(lineId, adminByLine, fieldByLine) {
   };
 }
 
-function fieldNotesForAdminPoV1_(procurementId, lineById) {
-  const notes = [];
-  recordsByFieldPoV1_(PO_V1.SHEETS.EXCEPTIONS, 'Procurement_ID', procurementId).forEach(function (row) {
-    const text = normalizePoV1_(row.Field_Notes);
-    const context = noteLineContextPoV1_(lineById || {}, row.Procurement_Line_ID);
-    if (text) notes.push({source: 'FIELD_EXCEPTION', lineId: row.Procurement_Line_ID, type: row.Exception_Type, text: text,
-      lineNumber: context.lineNumber, poNumber: context.poNumber, description: context.description,
-      createdByEmail: row.Reported_By_Email, createdByName: row.Reported_By_Name, createdAt: row.Reported_At});
-  });
-  recordsByFieldPoV1_(PO_V1.SHEETS.TRANSACTIONS, 'Procurement_ID', procurementId).forEach(function (row) {
-    const text = normalizePoV1_(row.Notes);
-    const context = noteLineContextPoV1_(lineById || {}, row.Procurement_Line_ID);
-    if (text && normalizeUpperPoV1_(row.Source_Interface) === 'FIELD') notes.push({source: 'FIELD_TRANSACTION', lineId: row.Procurement_Line_ID, type: row.Transaction_Type, text: text,
-      lineNumber: context.lineNumber, poNumber: context.poNumber, description: context.description,
-      createdByEmail: row.Authenticated_Email, createdByName: row.Performed_By_Name, createdAt: row.Event_At});
-  });
-  return notes.slice(-100).reverse();
-}
 
 function serializeHeaderPoV1_(header, lines, documents, user) {
   const currentLines = lines || [];
