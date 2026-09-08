@@ -160,15 +160,150 @@ function noteLineContextPoV1_(lineById, lineId) {
   return {lineNumber: line.Line_Number, poNumber: poNumberPoV1_(line), description: line.Material_Description};
 }
 
-function procurementNotesForAdminPoV1_(procurementId, lineById) {
-  return recordsByFieldPoV1_(PO_V1.SHEETS.PROCUREMENT_NOTES, 'Procurement_ID', procurementId).filter(function (row) {
-    return yesPoV1_(row.Active);
-  }).map(function (row) {
-    const context = noteLineContextPoV1_(lineById || {}, row.Procurement_Line_ID);
-    return {id: row.Note_ID, lineId: row.Procurement_Line_ID, type: row.Note_Type, text: row.Note_Text,
-      lineNumber: context.lineNumber, poNumber: context.poNumber, description: context.description,
-      createdByEmail: row.Created_By_Email, createdByName: row.Created_By_Name, createdAt: row.Created_At};
+const PO_V1_LINE_NOTE_POLICY = Object.freeze({
+  MAX_NOTES_PER_LINE: 20
+});
+
+function noteSortValuePoV1_(value) {
+  if (!value) return 0;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? 0 : date.getTime();
+}
+
+function adminLineNotesByLinePoV1_(procurementId, lineById) {
+  const byLine = {};
+
+  recordsByFieldPoV1_(PO_V1.SHEETS.PROCUREMENT_NOTES, 'Procurement_ID', procurementId)
+    .filter(function (row) { return yesPoV1_(row.Active); })
+    .forEach(function (row) {
+      const lineId = normalizePoV1_(row.Procurement_Line_ID);
+      if (!lineId || !lineById[lineId]) return;
+      if (!byLine[lineId]) byLine[lineId] = [];
+      byLine[lineId].push({
+        id: row.Note_ID,
+        source: 'ADMIN',
+        type: normalizePoV1_(row.Note_Type) || 'ADMIN_LINE',
+        text: normalizePoV1_(row.Note_Text),
+        quantity: 0,
+        uom: '',
+        createdByName: normalizePoV1_(row.Created_By_Name),
+        createdByEmail: normalizePoV1_(row.Created_By_Email),
+        createdAt: row.Created_At,
+        sortValue: noteSortValuePoV1_(row.Created_At)
+      });
+    });
+
+  // Backward-compatible fallback for manual/imported Admin_Notes values that
+  // were never written into Procurement_Notes.
+  Object.keys(lineById || {}).forEach(function (lineId) {
+    const line = lineById[lineId];
+    const text = normalizePoV1_(line.Admin_Notes);
+    if (!text) return;
+    const existing = byLine[lineId] || [];
+    if (existing.some(function (note) { return normalizePoV1_(note.text) === text; })) return;
+    if (!byLine[lineId]) byLine[lineId] = [];
+    byLine[lineId].push({
+      id: 'CURRENT-ADMIN-NOTE-' + lineId,
+      source: 'ADMIN',
+      type: 'CURRENT_ADMIN_NOTE',
+      text: text,
+      quantity: 0,
+      uom: '',
+      createdByName: '',
+      createdByEmail: normalizePoV1_(line.Updated_By),
+      createdAt: line.Updated_At || line.Created_At,
+      sortValue: noteSortValuePoV1_(line.Updated_At || line.Created_At)
+    });
   });
+
+  return byLine;
+}
+
+function fieldLineNotesByLinePoV1_(procurementId, lineById) {
+  const byLine = {};
+  const representedExceptionIds = {};
+
+  // Material_Transactions is the canonical display source when a Field
+  // transaction exists. This avoids showing DAMAGED/NOT_HERE/INCORRECT notes
+  // twice because those workflows also store Field_Notes on Delivery_Exceptions.
+  recordsByFieldPoV1_(PO_V1.SHEETS.TRANSACTIONS, 'Procurement_ID', procurementId)
+    .forEach(function (row) {
+      const lineId = normalizePoV1_(row.Procurement_Line_ID);
+      const text = normalizePoV1_(row.Notes);
+      if (!lineId || !lineById[lineId] || !yesPoV1_(row.Active)) return;
+      if (normalizeUpperPoV1_(row.Source_Interface) !== 'FIELD') return;
+      if (!text) return;
+
+      const exceptionId = normalizePoV1_(row.Delivery_Exception_ID);
+      if (exceptionId) representedExceptionIds[exceptionId] = true;
+      if (!byLine[lineId]) byLine[lineId] = [];
+      byLine[lineId].push({
+        id: row.Transaction_ID,
+        source: 'FIELD',
+        type: normalizePoV1_(row.Transaction_Type),
+        text: text,
+        quantity: numberPoV1_(row.Quantity),
+        uom: normalizePoV1_(row.UOM),
+        createdByName: normalizePoV1_(row.Performed_By_Name),
+        createdByEmail: normalizePoV1_(row.Authenticated_Email),
+        createdAt: row.Event_At,
+        sortValue: noteSortValuePoV1_(row.Event_At)
+      });
+    });
+
+  // Legacy fallback: if an exception note exists without a matching Field
+  // transaction note, preserve it rather than hiding historical information.
+  recordsByFieldPoV1_(PO_V1.SHEETS.EXCEPTIONS, 'Procurement_ID', procurementId)
+    .forEach(function (row) {
+      const lineId = normalizePoV1_(row.Procurement_Line_ID);
+      const exceptionId = normalizePoV1_(row.Exception_ID);
+      const text = normalizePoV1_(row.Field_Notes);
+      if (!lineId || !lineById[lineId] || !text) return;
+      if (exceptionId && representedExceptionIds[exceptionId]) return;
+      if (!byLine[lineId]) byLine[lineId] = [];
+      byLine[lineId].push({
+        id: exceptionId || ('LEGACY-EXCEPTION-' + lineId + '-' + noteSortValuePoV1_(row.Reported_At)),
+        source: 'FIELD',
+        type: normalizePoV1_(row.Exception_Type),
+        text: text,
+        quantity: numberPoV1_(row.Qty_Reported),
+        uom: normalizePoV1_(row.UOM),
+        createdByName: normalizePoV1_(row.Reported_By_Name),
+        createdByEmail: normalizePoV1_(row.Reported_By_Email),
+        createdAt: row.Reported_At,
+        sortValue: noteSortValuePoV1_(row.Reported_At)
+      });
+    });
+
+  return byLine;
+}
+
+function mergeLineNotesPoV1_(lineId, adminByLine, fieldByLine) {
+  const notes = []
+    .concat((adminByLine && adminByLine[lineId]) || [])
+    .concat((fieldByLine && fieldByLine[lineId]) || [])
+    .sort(function (left, right) {
+      return numberPoV1_(right.sortValue) - numberPoV1_(left.sortValue);
+    });
+
+  const totalCount = notes.length;
+  return {
+    noteCount: totalCount,
+    notesTruncated: totalCount > PO_V1_LINE_NOTE_POLICY.MAX_NOTES_PER_LINE,
+    notes: notes.slice(0, PO_V1_LINE_NOTE_POLICY.MAX_NOTES_PER_LINE).map(function (note) {
+      return {
+        id: note.id,
+        source: note.source,
+        type: note.type,
+        text: note.text,
+        quantity: note.quantity,
+        uom: note.uom,
+        createdByName: note.createdByName,
+        createdByEmail: note.createdByEmail,
+        createdAt: note.createdAt
+      };
+    })
+  };
 }
 
 function fieldNotesForAdminPoV1_(procurementId, lineById) {
@@ -192,37 +327,77 @@ function fieldNotesForAdminPoV1_(procurementId, lineById) {
 
 function serializeHeaderPoV1_(header, lines, documents, user) {
   const currentLines = lines || [];
-  const liveStatus = currentLines.length ? currentLines.map(function (line) { return calculateLineStatusPoV1_(line); })
-    .sort(function (left, right) { return lineStatusPriorityPoV1_(left) - lineStatusPriorityPoV1_(right); })[0] : header.Current_Status;
+  const liveStatus = currentLines.length
+    ? currentLines.map(function (line) { return calculateLineStatusPoV1_(line); })
+        .sort(function (left, right) { return lineStatusPriorityPoV1_(left) - lineStatusPriorityPoV1_(right); })[0]
+    : header.Current_Status;
   const canSeeReq = Boolean(user && (user.canAdminManage || user.canOwnerEdit));
   const poNumbers = uniquePoNumbersPoV1_(currentLines, header.Primary_PO_Number || header.Vendor_PO_Number);
   const primaryPo = poNumbers.length ? poNumbers[0] : normalizePoV1_(header.Primary_PO_Number || header.Vendor_PO_Number);
   const reqNumber = reqNumberPoV1_(header);
   const displayNumber = primaryPo || (canSeeReq ? reqNumber : 'PO not assigned');
-  const linePayload = currentLines.map(function (line) { return serializeLinePoV1_(line, user); });
+
   const lineById = {};
-  currentLines.forEach(function (line) { lineById[normalizePoV1_(line.Procurement_Line_ID)] = line; });
-  const adminNotes = canSeeReq ? procurementNotesForAdminPoV1_(header.Procurement_ID, lineById) : [];
-  const fieldNotes = canSeeReq ? fieldNotesForAdminPoV1_(header.Procurement_ID, lineById) : [];
+  currentLines.forEach(function (line) {
+    lineById[normalizePoV1_(line.Procurement_Line_ID)] = line;
+  });
+
+  // Match the FMRv3 pattern: note history is hydrated on detail only, capped,
+  // and attached to each line. Search uses a separate lightweight serializer.
+  const adminByLine = canSeeReq ? adminLineNotesByLinePoV1_(header.Procurement_ID, lineById) : {};
+  const fieldByLine = canSeeReq ? fieldLineNotesByLinePoV1_(header.Procurement_ID, lineById) : {};
+
+  const linePayload = currentLines.map(function (line) {
+    const serialized = serializeLinePoV1_(line, user);
+    const lineId = normalizePoV1_(line.Procurement_Line_ID);
+    const notePayload = canSeeReq
+      ? mergeLineNotesPoV1_(lineId, adminByLine, fieldByLine)
+      : {noteCount: 0, notesTruncated: false, notes: []};
+    return Object.assign(serialized, notePayload);
+  });
+
+  const headerAdminNotes = canSeeReq ? normalizePoV1_(header.Admin_Notes) : '';
   return {
-    id: header.Procurement_ID, documentType: header.Document_Type, documentNumber: canSeeReq ? header.Document_Number : displayNumber, reqNumber: canSeeReq ? reqNumber : '',
-    poNumber: primaryPo, poNumbers: poNumbers, orderSuffix: canSeeReq ? header.Order_Suffix : '',
-    displayNumber: displayNumber, cloudDriveName: canSeeReq ? normalizePoV1_(header.Cloud_Drive_Name) : '', branchPlant: header.Branch_Plant,
-    shipFrom: header.Ship_From, shipToAddress: header.Ship_To_Address, shipToContact: header.Ship_To_Contact, shipToPhone: header.Ship_To_Phone,
-    orderedDate: dateKeyPoV1_(header.Ordered_Date), requestedDate: dateKeyPoV1_(header.Requested_Date), importedDeliveryDate: dateKeyPoV1_(header.Imported_Delivery_Date),
-    vendorName: header.Vendor_Name, vendorPoNumber: header.Vendor_PO_Number, status: liveStatus, totalLines: numberPoV1_(header.Total_Lines),
-    quantityOrdered: numberPoV1_(header.Qty_Ordered), quantityReceivedGood: numberPoV1_(header.Qty_Received_Good), quantityOpen: numberPoV1_(header.Qty_Open),
-    quantityDamaged: numberPoV1_(header.Qty_Damaged_Open), quantityIncorrect: numberPoV1_(header.Qty_Incorrect_Open),
+    id: header.Procurement_ID,
+    documentType: header.Document_Type,
+    documentNumber: canSeeReq ? header.Document_Number : displayNumber,
+    reqNumber: canSeeReq ? reqNumber : '',
+    poNumber: primaryPo,
+    poNumbers: poNumbers,
+    orderSuffix: canSeeReq ? header.Order_Suffix : '',
+    displayNumber: displayNumber,
+    cloudDriveName: canSeeReq ? normalizePoV1_(header.Cloud_Drive_Name) : '',
+    branchPlant: header.Branch_Plant,
+    shipFrom: header.Ship_From,
+    shipToAddress: header.Ship_To_Address,
+    shipToContact: header.Ship_To_Contact,
+    shipToPhone: header.Ship_To_Phone,
+    orderedDate: dateKeyPoV1_(header.Ordered_Date),
+    requestedDate: dateKeyPoV1_(header.Requested_Date),
+    importedDeliveryDate: dateKeyPoV1_(header.Imported_Delivery_Date),
+    vendorName: header.Vendor_Name,
+    vendorPoNumber: header.Vendor_PO_Number,
+    status: liveStatus,
+    totalLines: numberPoV1_(header.Total_Lines),
+    quantityOrdered: numberPoV1_(header.Qty_Ordered),
+    quantityReceivedGood: numberPoV1_(header.Qty_Received_Good),
+    quantityOpen: numberPoV1_(header.Qty_Open),
+    quantityDamaged: numberPoV1_(header.Qty_Damaged_Open),
+    quantityIncorrect: numberPoV1_(header.Qty_Incorrect_Open),
     quantityNotHere: numberPoV1_(header.Qty_Not_Here_Open),
-    quantityVendorBackordered: numberPoV1_(header.Qty_Vendor_Backordered), sourceRevision: numberPoV1_(header.Source_Revision),
-    adminNotes: adminNotes, fieldNotes: fieldNotes, hasNotes: Boolean(adminNotes.length || fieldNotes.length || normalizePoV1_(header.Admin_Notes)),
-    headerAdminNotes: canSeeReq ? normalizePoV1_(header.Admin_Notes) : '', lines: linePayload, documents: documents || []
+    quantityVendorBackordered: numberPoV1_(header.Qty_Vendor_Backordered),
+    sourceRevision: numberPoV1_(header.Source_Revision),
+    headerAdminNotes: headerAdminNotes,
+    hasNotes: Boolean(headerAdminNotes || linePayload.some(function (line) { return numberPoV1_(line.noteCount) > 0; })),
+    lines: linePayload,
+    documents: documents || []
   };
 }
 
 function serializeAdminDocumentSummaryPoV1_(header) {
   const reqNumber = reqNumberPoV1_(header);
   const primaryPo = normalizePoV1_(header.Primary_PO_Number || header.Vendor_PO_Number);
+  const hasReqNote = Boolean(normalizePoV1_(header.Admin_Notes));
   return {
     id: header.Procurement_ID,
     documentType: header.Document_Type,
@@ -248,7 +423,10 @@ function serializeAdminDocumentSummaryPoV1_(header) {
     quantityIncorrect: numberPoV1_(header.Qty_Incorrect_Open),
     quantityNotHere: numberPoV1_(header.Qty_Not_Here_Open),
     quantityVendorBackordered: numberPoV1_(header.Qty_Vendor_Backordered),
-    hasNotes: Boolean(normalizePoV1_(header.Admin_Notes)) || recordsByFieldPoV1_(PO_V1.SHEETS.PROCUREMENT_NOTES, 'Procurement_ID', header.Procurement_ID).some(function (row) { return yesPoV1_(row.Active); }),
+    // Do not perform a Procurement_Notes lookup per collapsed document.
+    // Line-note history loads only when the detail is expanded.
+    hasReqNote: hasReqNote,
+    hasNotes: hasReqNote,
     updatedAt: header.Updated_At,
     lastActivityAt: header.Last_Activity_At
   };
@@ -290,23 +468,43 @@ function getAdminDocumentSearchPagePoV1_(query, pageSize, cursor) {
   const offset = Math.max(0, numberPoV1_(cursor));
   const rowNumbers = [];
   searchCandidatesPoV1_(query).forEach(function (key) {
-    findRowsByExactValuePoV1_(PO_V1.SHEETS.SEARCH_INDEX, 'Search_Key', key).forEach(function (rowNumber) { rowNumbers.push(rowNumber); });
+    findRowsByExactValuePoV1_(PO_V1.SHEETS.SEARCH_INDEX, 'Search_Key', key)
+      .forEach(function (rowNumber) { rowNumbers.push(rowNumber); });
   });
+
   const seen = {};
-  const orderedIds = [];
+  const orderedMatches = [];
   readRowObjectsPoV1_(PO_V1.SHEETS.SEARCH_INDEX, rowNumbers).forEach(function (row) {
     const procurementId = normalizePoV1_(row.Procurement_ID);
-    if (yesPoV1_(row.Active) && procurementId && !seen[procurementId]) {
-      seen[procurementId] = true;
-      orderedIds.push(procurementId);
-    }
+    if (!yesPoV1_(row.Active) || !procurementId || seen[procurementId]) return;
+    seen[procurementId] = true;
+    orderedMatches.push({
+      procurementId: procurementId,
+      headerRow: numberPoV1_(row.Header_Row)
+    });
   });
+
   const nextOffset = offset + pageSize;
-  const documents = orderedIds.slice(offset, nextOffset).map(function (id) {
-    const header = findRecordByFieldPoV1_(PO_V1.SHEETS.HEADERS, 'Procurement_ID', id);
+  const pageMatches = orderedMatches.slice(offset, nextOffset);
+  const headerRows = pageMatches.map(function (item) { return item.headerRow; })
+    .filter(function (row) { return row >= 2; });
+  const headersById = {};
+
+  readRowObjectsPoV1_(PO_V1.SHEETS.HEADERS, headerRows).forEach(function (header) {
+    const id = normalizePoV1_(header.Procurement_ID);
+    if (id) headersById[id] = header;
+  });
+
+  const documents = pageMatches.map(function (item) {
+    let header = headersById[item.procurementId];
+    if (!header) {
+      // Backward compatibility for old/stale Search_Index rows.
+      header = findRecordByFieldPoV1_(PO_V1.SHEETS.HEADERS, 'Procurement_ID', item.procurementId);
+    }
     return header && yesPoV1_(header.Active) ? serializeAdminDocumentSummaryPoV1_(header) : null;
   }).filter(Boolean);
-  const nextCursor = nextOffset < orderedIds.length ? String(nextOffset) : '';
+
+  const nextCursor = nextOffset < orderedMatches.length ? String(nextOffset) : '';
   return {mode: 'SEARCH', query: query, pageSize: pageSize, nextCursor: nextCursor, hasMore: Boolean(nextCursor), documents: documents};
 }
 
@@ -343,22 +541,73 @@ function searchCandidatesPoV1_(query) {
     'ORDER:' + raw, 'ORDER:' + compact, 'JOB:' + raw, 'ACCOUNT:' + raw, 'LINE:' + raw, 'DOC:REQUISITION:' + raw, 'DOC:PURCHASE_ORDER:' + raw]));
 }
 
+function serializeSearchSummaryPoV1_(header, user) {
+  const canSeeReq = Boolean(user && (user.canAdminManage || user.canOwnerEdit));
+  const primaryPo = normalizePoV1_(header.Primary_PO_Number || header.Vendor_PO_Number);
+  const reqNumber = reqNumberPoV1_(header);
+  const displayNumber = primaryPo || (canSeeReq ? reqNumber : 'PO not assigned');
+  return {
+    id: header.Procurement_ID,
+    documentType: header.Document_Type,
+    documentNumber: canSeeReq ? header.Document_Number : displayNumber,
+    reqNumber: canSeeReq ? reqNumber : '',
+    poNumber: primaryPo,
+    displayNumber: displayNumber,
+    branchPlant: header.Branch_Plant,
+    status: header.Current_Status,
+    totalLines: numberPoV1_(header.Total_Lines),
+    quantityOrdered: numberPoV1_(header.Qty_Ordered),
+    quantityReceivedGood: numberPoV1_(header.Qty_Received_Good),
+    quantityOpen: numberPoV1_(header.Qty_Open),
+    quantityDamaged: numberPoV1_(header.Qty_Damaged_Open),
+    quantityIncorrect: numberPoV1_(header.Qty_Incorrect_Open),
+    quantityNotHere: numberPoV1_(header.Qty_Not_Here_Open),
+    quantityVendorBackordered: numberPoV1_(header.Qty_Vendor_Backordered)
+  };
+}
+
 function searchProcurementPoV1_(userEmail, query) {
   const user = assertSearchUserPoV1_(userEmail);
   const candidates = searchCandidatesPoV1_(query);
   if (!candidates.length) throw new Error('Search value is required.');
-  const ids = {};
+
+  const indexRowNumbers = [];
   candidates.forEach(function (key) {
-    findRowsByExactValuePoV1_(PO_V1.SHEETS.SEARCH_INDEX, 'Search_Key', key).forEach(function (rowNumber) {
-      const row = readRowObjectPoV1_(PO_V1.SHEETS.SEARCH_INDEX, rowNumber);
-      if (yesPoV1_(row.Active)) ids[row.Procurement_ID] = true;
-    });
+    findRowsByExactValuePoV1_(PO_V1.SHEETS.SEARCH_INDEX, 'Search_Key', key)
+      .forEach(function (rowNumber) { indexRowNumbers.push(rowNumber); });
   });
-  const results = Object.keys(ids).slice(0, PO_V1.LIMITS.MAX_SEARCH_RESULTS).map(function (id) {
-    const header = findRecordByFieldPoV1_(PO_V1.SHEETS.HEADERS, 'Procurement_ID', id);
-    const lines = recordsByFieldPoV1_(PO_V1.SHEETS.LINES, 'Procurement_ID', id).filter(function (line) { return yesPoV1_(line.Active); });
-    return serializeHeaderPoV1_(header, lines, [], user);
+
+  const orderedIds = [];
+  const indexByProcurementId = {};
+  readRowObjectsPoV1_(PO_V1.SHEETS.SEARCH_INDEX, indexRowNumbers).forEach(function (row) {
+    if (!yesPoV1_(row.Active)) return;
+    const procurementId = normalizePoV1_(row.Procurement_ID);
+    if (!procurementId || indexByProcurementId[procurementId]) return;
+    indexByProcurementId[procurementId] = row;
+    orderedIds.push(procurementId);
   });
+
+  const limitedIds = orderedIds.slice(0, PO_V1.LIMITS.MAX_SEARCH_RESULTS);
+  const headerRows = limitedIds.map(function (id) {
+    return numberPoV1_(indexByProcurementId[id] && indexByProcurementId[id].Header_Row);
+  }).filter(function (row) { return row >= 2; });
+
+  const headersById = {};
+  readRowObjectsPoV1_(PO_V1.SHEETS.HEADERS, headerRows).forEach(function (header) {
+    const id = normalizePoV1_(header.Procurement_ID);
+    if (id) headersById[id] = header;
+  });
+
+  const results = limitedIds.map(function (id) {
+    let header = headersById[id];
+    if (!header) {
+      // Compatibility fallback for indexes created before Header_Row was populated.
+      header = findRecordByFieldPoV1_(PO_V1.SHEETS.HEADERS, 'Procurement_ID', id);
+    }
+    if (!header || !yesPoV1_(header.Active)) return null;
+    return serializeSearchSummaryPoV1_(header, user);
+  }).filter(Boolean);
+
   return {query: query, resultCount: results.length, results: results, user: user};
 }
 
