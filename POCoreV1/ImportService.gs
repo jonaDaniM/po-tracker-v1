@@ -478,10 +478,32 @@ function getRecentImportBatchesPoV1_(limit) {
 }
 
 function deactivateSearchIndexPoV1_(procurementId) {
-  recordsByFieldPoV1_(PO_V1.SHEETS.SEARCH_INDEX, 'Procurement_ID', procurementId).forEach(function (row) {
-    if (yesPoV1_(row.Active)) updateRowObjectPoV1_(PO_V1.SHEETS.SEARCH_INDEX, row._rowNumber, {Active: PO_V1.NO, Updated_At: nowPoV1_()});
-  });
+  const now = nowPoV1_();
+
+  const updates = recordsByFieldPoV1_(
+    PO_V1.SHEETS.SEARCH_INDEX,
+    'Procurement_ID',
+    procurementId
+  )
+    .filter(function (row) {
+      return yesPoV1_(row.Active);
+    })
+    .map(function (row) {
+      return {
+        rowNumber: row._rowNumber,
+        patch: {
+          Active: PO_V1.NO,
+          Updated_At: now
+        }
+      };
+    });
+
+  updateRowObjectsPoV1_(
+    PO_V1.SHEETS.SEARCH_INDEX,
+    updates
+  );
 }
+
 
 function rebuildProcurementSearchIndexPoV1_(header, lines) {
   const existing = recordsByFieldPoV1_(PO_V1.SHEETS.SEARCH_INDEX, 'Procurement_ID', header.Procurement_ID);

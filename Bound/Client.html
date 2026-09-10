@@ -987,28 +987,76 @@ async function finishAdminEdit(detail, message, options = {}) {
   }
   
   function deleteReqModal(procurementId) {
-    openModal(`<h3>Delete entire req</h3><p class="error-text">This soft-deletes the req and all active, untransacted items. Reqs with field activity are blocked.</p><form id="deleteReqForm" class="form-grid"><textarea id="deleteReqReason" placeholder="Reason" required></textarea><button class="danger">Delete req</button></form>`);
-    $('#deleteReqForm').addEventListener('submit', async event => {
-      event.preventDefault();
-      const form = event.currentTarget;
-      if (form.dataset.submitting === 'YES') return;
-      try {
-        lockForm(form, true);
-        busy('Deleting req...');
-        const result = await callServer('poDeleteReq', {procurementId, reason: $('#deleteReqReason').value});
-        closeModal();
+  openModal(
+    `<h3>Delete entire req</h3>
+     <p class="error-text">
+       This soft-deletes the req. Reqs with physical receipt activity
+       (Here, Damaged, or Incorrect Item) remain protected. A req that only has
+       Not Here / Vendor Backorder activity may be cancelled; transaction and
+       audit history remains intact.
+     </p>
+     <form id="deleteReqForm" class="form-grid">
+       <textarea id="deleteReqReason" placeholder="Reason" required></textarea>
+       <button class="danger">Delete req</button>
+     </form>`
+  );
+
+  $('#deleteReqForm').addEventListener('submit', async event => {
+    event.preventDefault();
+
+    const form = event.currentTarget;
+    if (form.dataset.submitting === 'YES') return;
+
+    try {
+      lockForm(form, true);
+      busy('Deleting req...');
+
+      const result = await callServer(
+        'poDeleteReq',
+        {
+          procurementId: procurementId,
+          reason: $('#deleteReqReason').value
+        }
+      );
+
+      closeModal();
+
+      if (
+        state.currentDetail &&
+        state.currentDetail.id === procurementId
+      ) {
         state.currentDetail = null;
         $('#orderDetail').innerHTML = '';
-        state.admin = null;
-        await loadAdmin();
-        idle();
-        toast(`Req deleted with ${result.deletedLineCount || 0} item(s).`);
-      } catch (error) {
-        lockForm(form, false);
-        fail(error);
       }
-    });
-  }
+
+      delete state.adminDocumentDetails[procurementId];
+      delete state.adminDocumentErrors[procurementId];
+      delete state.expandedAdminDocuments[procurementId];
+
+      state.adminDocuments.items =
+        state.adminDocuments.items.filter(function (doc) {
+          return doc.id !== procurementId;
+        });
+
+      renderAdminDocuments();
+      idle();
+
+      toast(`Req deleted with ${result.deletedLineCount || 0} item(s).`);
+
+      try {
+        await refreshAdminDashboardOnly();
+      } catch (dashboardError) {
+        toast(
+          'Req was deleted, but dashboard totals could not be refreshed automatically.',
+          true
+        );
+      }
+    } catch (error) {
+      lockForm(form, false);
+      fail(error);
+    }
+  });
+}
   
   function addSelectedLineNoteModal(procurementId) {
     const lineIds = selectedAdminLineIds(procurementId);

@@ -24,38 +24,168 @@ function activeLinesByIdsPoV1_(procurementId, lineIds) {
   return lines;
 }
 
-function linesWithOperationalActivityPoV1_(procurementId, lines) {
+function linesWithPhysicalReceiptActivityPoV1_(procurementId, lines) {
   const sourceLines = Array.isArray(lines) ? lines : [];
   if (!sourceLines.length) return [];
 
   const wanted = {};
   const blocked = {};
+
   sourceLines.forEach(function (line) {
     const lineId = normalizePoV1_(line.Procurement_Line_ID);
     if (!lineId) return;
+
     wanted[lineId] = true;
+
     if (
-      numberPoV1_(line.Qty_Received_Good) ||
-      numberPoV1_(line.Qty_Damaged_Open) ||
-      numberPoV1_(line.Qty_Incorrect_Open) ||
-      numberPoV1_(line.Qty_Not_Here_Open) ||
-      numberPoV1_(line.Qty_Vendor_Backordered)
+      numberPoV1_(line.Qty_Received_Good) > 0 ||
+      numberPoV1_(line.Qty_Damaged_Open) > 0 ||
+      numberPoV1_(line.Qty_Incorrect_Open) > 0
     ) {
       blocked[lineId] = true;
     }
   });
 
-  // One requisition-level transaction read replaces one TextFinder/read per line.
-  recordsByFieldPoV1_(PO_V1.SHEETS.TRANSACTIONS, 'Procurement_ID', procurementId)
-    .forEach(function (row) {
-      const lineId = normalizePoV1_(row.Procurement_Line_ID);
-      if (wanted[lineId] && yesPoV1_(row.Active)) blocked[lineId] = true;
-    });
+  const physicalTransactionTypes = {
+    RECEIVED_GOOD: true,
+    DAMAGED_REPORTED: true,
+    INCORRECT_ITEM_REPORTED: true
+  };
+
+  recordsByFieldPoV1_(
+    PO_V1.SHEETS.TRANSACTIONS,
+    'Procurement_ID',
+    procurementId
+  ).forEach(function (row) {
+    const lineId = normalizePoV1_(row.Procurement_Line_ID);
+    const transactionType = normalizeUpperPoV1_(row.Transaction_Type);
+
+    if (
+      wanted[lineId] &&
+      yesPoV1_(row.Active) &&
+      physicalTransactionTypes[transactionType]
+    ) {
+      blocked[lineId] = true;
+    }
+  });
 
   return sourceLines.filter(function (line) {
-    return Boolean(blocked[normalizePoV1_(line.Procurement_Line_ID)]);
+    return Boolean(
+      blocked[normalizePoV1_(line.Procurement_Line_ID)]
+    );
   });
 }
+
+function cancelNonReceiptClassificationsForLinesPoV1_(
+  procurementId,
+  lines,
+  user,
+  reason,
+  now
+) {
+  const sourceLines = Array.isArray(lines) ? lines : [];
+  const wanted = {};
+
+  sourceLines.forEach(function (line) {
+    const lineId = normalizePoV1_(line.Procurement_Line_ID);
+    if (lineId) wanted[lineId] = true;
+  });
+
+  const needsNotHereCleanup = sourceLines.some(function (line) {
+    return numberPoV1_(line.Qty_Not_Here_Open) > 0;
+  });
+
+  const needsBackorderCleanup = sourceLines.some(function (line) {
+    return numberPoV1_(line.Qty_Vendor_Backordered) > 0;
+  });
+
+  let cancelledExceptions = 0;
+  let cancelledBackorders = 0;
+
+  if (needsNotHereCleanup) {
+    const exceptionUpdates = recordsByFieldPoV1_(
+      PO_V1.SHEETS.EXCEPTIONS,
+      'Procurement_ID',
+      procurementId
+    )
+      .filter(function (row) {
+        return (
+          yesPoV1_(row.Active) &&
+          wanted[normalizePoV1_(row.Procurement_Line_ID)] &&
+          normalizeUpperPoV1_(row.Exception_Type) === 'NOT_HERE'
+        );
+      })
+      .map(function (row) {
+        cancelledExceptions += 1;
+
+        return {
+          rowNumber: row._rowNumber,
+          patch: {
+            Qty_Resolved:
+              numberPoV1_(row.Qty_Resolved) +
+              numberPoV1_(row.Qty_Active),
+            Qty_Active: 0,
+            Status: 'CANCELLED',
+            Resolved_By_Email: user.email,
+            Resolved_At: now,
+            Resolution: 'REQ_OR_LINE_CANCELLED',
+            Active: PO_V1.NO,
+            Updated_At: now
+          }
+        };
+      });
+
+    updateRowObjectsPoV1_(
+      PO_V1.SHEETS.EXCEPTIONS,
+      exceptionUpdates
+    );
+  }
+
+  if (needsBackorderCleanup) {
+    const backorderUpdates = recordsByFieldPoV1_(
+      PO_V1.SHEETS.BACKORDERS,
+      'Procurement_ID',
+      procurementId
+    )
+      .filter(function (row) {
+        return (
+          yesPoV1_(row.Active) &&
+          wanted[normalizePoV1_(row.Procurement_Line_ID)]
+        );
+      })
+      .map(function (row) {
+        cancelledBackorders += 1;
+
+        return {
+          rowNumber: row._rowNumber,
+          patch: {
+            Qty_Resolved:
+              numberPoV1_(row.Qty_Resolved) +
+              numberPoV1_(row.Qty_Active),
+            Qty_Active: 0,
+            Status: 'CANCELLED',
+            Resolved_At: now,
+            Active: PO_V1.NO,
+            Updated_At: now
+          }
+        };
+      });
+
+    updateRowObjectsPoV1_(
+      PO_V1.SHEETS.BACKORDERS,
+      backorderUpdates
+    );
+  }
+
+  return {
+    cancelledExceptions: cancelledExceptions,
+    cancelledBackorders: cancelledBackorders,
+    reason: reason
+  };
+}
+
+
+
 
 
 function deletionRecordPoV1_(entityType, record, user, reason, correlationId) {
@@ -243,61 +373,271 @@ function addProcurementLinePoV1_(userEmail, request) {
 function deleteProcurementLinesPoV1_(userEmail, request) {
   const user = assertAdminEditorPoV1_(userEmail);
   assertWriteEnabledPoV1_('Line delete');
+
   const source = request || {};
   const procurementId = normalizePoV1_(source.procurementId);
   const reason = adminReasonPoV1_(source.reason, 'Line deletion reason');
-  const lock = LockService.getScriptLock(); lock.waitLock(PO_V1.LIMITS.LOCK_TIMEOUT_MS);
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(PO_V1.LIMITS.LOCK_TIMEOUT_MS);
+
   try {
     activeProcurementHeaderPoV1_(procurementId);
+
     const lines = activeLinesByIdsPoV1_(procurementId, source.lineIds);
-    const blocked = linesWithOperationalActivityPoV1_(procurementId, lines);
-    if (blocked.length) throw new Error('Line(s) with receiving, exception, or backorder activity cannot be deleted by Admin. Correct the activity first: ' + blocked.map(function (line) { return line.Line_Number; }).join(', '));
+
+    const blocked = linesWithPhysicalReceiptActivityPoV1_(
+      procurementId,
+      lines
+    );
+
+    if (blocked.length) {
+      throw new Error(
+        'Line(s) with physical receipt activity cannot be deleted by Admin: ' +
+        blocked.map(function (line) { return line.Line_Number; }).join(', ') +
+        '. Here, Damaged, and Incorrect Item activity must remain traceable.'
+      );
+    }
+
     const now = nowPoV1_();
     const correlationId = uuidPoV1_('CORR');
-    updateRowObjectsPoV1_(PO_V1.SHEETS.LINES, lines.map(function (line) {
-      return {rowNumber: line._rowNumber, patch: {Active: PO_V1.NO, Qty_Open: 0, Deleted_By_Email: user.email, Deleted_By_Name: user.name,
-        Deleted_At: now, Deletion_Reason: reason, Updated_By: user.email, Updated_At: now}};
-    }));
-    appendObjectsPoV1_(PO_V1.SHEETS.RECORD_DELETIONS, lines.map(function (line) { return deletionRecordPoV1_('PROCUREMENT_LINE', line, user, reason, correlationId); }));
+
+    const cancellation = cancelNonReceiptClassificationsForLinesPoV1_(
+      procurementId,
+      lines,
+      user,
+      reason,
+      now
+    );
+
+    updateRowObjectsPoV1_(
+      PO_V1.SHEETS.LINES,
+      lines.map(function (line) {
+        return {
+          rowNumber: line._rowNumber,
+          patch: {
+            Active: PO_V1.NO,
+            Qty_Open: 0,
+            Qty_Damaged_Open: 0,
+            Qty_Incorrect_Open: 0,
+            Qty_Not_Here_Open: 0,
+            Qty_Vendor_Backordered: 0,
+            Has_Open_Exception: PO_V1.NO,
+            Deleted_By_Email: user.email,
+            Deleted_By_Name: user.name,
+            Deleted_At: now,
+            Deletion_Reason: reason,
+            Updated_By: user.email,
+            Updated_At: now
+          }
+        };
+      })
+    );
+
+    appendObjectsPoV1_(
+      PO_V1.SHEETS.RECORD_DELETIONS,
+      lines.map(function (line) {
+        return deletionRecordPoV1_(
+          'PROCUREMENT_LINE',
+          line,
+          user,
+          reason,
+          correlationId
+        );
+      })
+    );
+
     recalculateProcurementPoV1_(procurementId, user.email);
-    rebuildProcurementSearchIndexPoV1_(findRecordByFieldPoV1_(PO_V1.SHEETS.HEADERS, 'Procurement_ID', procurementId), activeLinesForProcurementPoV1_(procurementId));
-    appendAuditPoV1_('PROCUREMENT', procurementId, 'LINES_DELETED', user, correlationId, {sourceInterface: 'ADMIN', payload: {lineCount: lines.length, reason: reason}});
+
+    rebuildProcurementSearchIndexPoV1_(
+      findRecordByFieldPoV1_(
+        PO_V1.SHEETS.HEADERS,
+        'Procurement_ID',
+        procurementId
+      ),
+      activeLinesForProcurementPoV1_(procurementId)
+    );
+
+    appendAuditPoV1_(
+      'PROCUREMENT',
+      procurementId,
+      'LINES_DELETED',
+      user,
+      correlationId,
+      {
+        sourceInterface: 'ADMIN',
+        payload: {
+          lineCount: lines.length,
+          reason: reason,
+          cancelledNotHereExceptions: cancellation.cancelledExceptions,
+          cancelledBackorders: cancellation.cancelledBackorders
+        }
+      }
+    );
+
     SpreadsheetApp.flush();
     return getProcurementDetailPoV1_(user.email, procurementId);
-  } finally { lock.releaseLock(); }
+  } finally {
+    lock.releaseLock();
+  }
 }
+
 
 function deleteProcurementPoV1_(userEmail, request) {
   const user = assertAdminEditorPoV1_(userEmail);
   assertWriteEnabledPoV1_('Req delete');
+
   const source = request || {};
   const procurementId = normalizePoV1_(source.procurementId);
   const reason = adminReasonPoV1_(source.reason, 'Req deletion reason');
-  const lock = LockService.getScriptLock(); lock.waitLock(PO_V1.LIMITS.LOCK_TIMEOUT_MS);
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(PO_V1.LIMITS.LOCK_TIMEOUT_MS);
+
   try {
     const header = activeProcurementHeaderPoV1_(procurementId);
     const lines = activeLinesForProcurementPoV1_(procurementId);
-    const blocked = linesWithOperationalActivityPoV1_(procurementId, lines);
-    if (blocked.length) throw new Error('This req has receiving, exception, or backorder activity and cannot be deleted by Admin. Correct activity first or ask an Owner to review.');
+
+    const blocked = linesWithPhysicalReceiptActivityPoV1_(
+      procurementId,
+      lines
+    );
+
+    if (blocked.length) {
+      throw new Error(
+        'This req contains physical receipt activity and cannot be deleted by Admin. ' +
+        'Here, Damaged, and Incorrect Item activity must remain traceable. ' +
+        'Not Here / Vendor Backorder-only reqs can be cancelled.'
+      );
+    }
+
     const now = nowPoV1_();
     const correlationId = uuidPoV1_('CORR');
-    updateRowObjectPoV1_(PO_V1.SHEETS.HEADERS, header._rowNumber, {Active: PO_V1.NO, Qty_Open: 0, Deleted_By_Email: user.email, Deleted_By_Name: user.name,
-      Deleted_At: now, Deletion_Reason: reason, Updated_By: user.email, Updated_At: now});
-    updateRowObjectsPoV1_(PO_V1.SHEETS.LINES, lines.map(function (line) {
-      return {rowNumber: line._rowNumber, patch: {Active: PO_V1.NO, Qty_Open: 0, Deleted_By_Email: user.email, Deleted_By_Name: user.name,
-        Deleted_At: now, Deletion_Reason: reason, Updated_By: user.email, Updated_At: now}};
-    }));
-    const deletionRows = [deletionRecordPoV1_('PROCUREMENT', header, user, reason, correlationId)].concat(lines.map(function (line) { return deletionRecordPoV1_('PROCUREMENT_LINE', line, user, reason, correlationId); }));
+
+    const cancellation = cancelNonReceiptClassificationsForLinesPoV1_(
+      procurementId,
+      lines,
+      user,
+      reason,
+      now
+    );
+
+    updateRowObjectPoV1_(
+      PO_V1.SHEETS.HEADERS,
+      header._rowNumber,
+      {
+        Active: PO_V1.NO,
+        Qty_Open: 0,
+        Qty_Damaged_Open: 0,
+        Qty_Incorrect_Open: 0,
+        Qty_Not_Here_Open: 0,
+        Qty_Vendor_Backordered: 0,
+        Deleted_By_Email: user.email,
+        Deleted_By_Name: user.name,
+        Deleted_At: now,
+        Deletion_Reason: reason,
+        Updated_By: user.email,
+        Updated_At: now
+      }
+    );
+
+    updateRowObjectsPoV1_(
+      PO_V1.SHEETS.LINES,
+      lines.map(function (line) {
+        return {
+          rowNumber: line._rowNumber,
+          patch: {
+            Active: PO_V1.NO,
+            Qty_Open: 0,
+            Qty_Damaged_Open: 0,
+            Qty_Incorrect_Open: 0,
+            Qty_Not_Here_Open: 0,
+            Qty_Vendor_Backordered: 0,
+            Has_Open_Exception: PO_V1.NO,
+            Deleted_By_Email: user.email,
+            Deleted_By_Name: user.name,
+            Deleted_At: now,
+            Deletion_Reason: reason,
+            Updated_By: user.email,
+            Updated_At: now
+          }
+        };
+      })
+    );
+
+    const deletionRows = [
+      deletionRecordPoV1_(
+        'PROCUREMENT',
+        header,
+        user,
+        reason,
+        correlationId
+      )
+    ].concat(
+      lines.map(function (line) {
+        return deletionRecordPoV1_(
+          'PROCUREMENT_LINE',
+          line,
+          user,
+          reason,
+          correlationId
+        );
+      })
+    );
+
     appendObjectsPoV1_(PO_V1.SHEETS.RECORD_DELETIONS, deletionRows);
+
     deactivateSearchIndexPoV1_(procurementId);
-    updateRowObjectsPoV1_(PO_V1.SHEETS.OPERATIONAL_INDEX, recordsByFieldPoV1_(PO_V1.SHEETS.OPERATIONAL_INDEX, 'Parent_ID', procurementId).map(function (row) {
-      return {rowNumber: row._rowNumber, patch: {Active: PO_V1.NO, Updated_At: now}};
-    }));
-    appendAuditPoV1_('PROCUREMENT', procurementId, 'REQ_DELETED', user, correlationId, {sourceInterface: 'ADMIN', payload: {lineCount: lines.length, reason: reason}});
+
+    updateRowObjectsPoV1_(
+      PO_V1.SHEETS.OPERATIONAL_INDEX,
+      recordsByFieldPoV1_(
+        PO_V1.SHEETS.OPERATIONAL_INDEX,
+        'Parent_ID',
+        procurementId
+      ).map(function (row) {
+        return {
+          rowNumber: row._rowNumber,
+          patch: {
+            Active: PO_V1.NO,
+            Updated_At: now
+          }
+        };
+      })
+    );
+
+    appendAuditPoV1_(
+      'PROCUREMENT',
+      procurementId,
+      'REQ_DELETED',
+      user,
+      correlationId,
+      {
+        sourceInterface: 'ADMIN',
+        payload: {
+          lineCount: lines.length,
+          reason: reason,
+          cancelledNotHereExceptions: cancellation.cancelledExceptions,
+          cancelledBackorders: cancellation.cancelledBackorders
+        }
+      }
+    );
+
     SpreadsheetApp.flush();
-    return {success: true, procurementId: procurementId, deletedLineCount: lines.length};
-  } finally { lock.releaseLock(); }
+
+    return {
+      success: true,
+      procurementId: procurementId,
+      deletedLineCount: lines.length,
+      cancelledNotHereExceptions: cancellation.cancelledExceptions,
+      cancelledBackorders: cancellation.cancelledBackorders
+    };
+  } finally {
+    lock.releaseLock();
+  }
 }
+
+
 
 function addProcurementNotePoV1_(userEmail, request) {
   const user = assertAdminEditorPoV1_(userEmail);
