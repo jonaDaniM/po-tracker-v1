@@ -153,7 +153,7 @@ function parseR5543500RequisitionPoV1_(spreadsheet) {
     orderTakenBy: extractLabeledValuePoV1_(displayValues, 'ORDER TAKEN BY'),
     reference: extractLabeledValuePoV1_(displayValues, 'REFERENCE'),
     vendorName: '',
-    vendorPoNumber: '',
+    vendorPoNumber: normalizePoV1_(order.number),
     worksheetName: sheet.getName()
   };
   if (!header.documentNumber) issues.push(createImportIssuePoV1_('ERROR', 'DOCUMENT_NUMBER_MISSING', 'Document Number', 0, 'Order Number is required.', ''));

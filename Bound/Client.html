@@ -747,49 +747,171 @@ async function loadAdminDocumentNotes(procurementId) {
   return detail;
 }
 
+function patchAdminDocumentSummaryFromDetail(detail) {
+  if (!detail || !detail.id) return;
 
-  async function finishAdminEdit(detail, message, options = {}) {
-    state.currentDetail = state.currentDetail && state.currentDetail.id === detail.id ? detail : state.currentDetail;
-    state.adminDocumentDetails[detail.id] = detail;
-    renderAdminDocuments();
-    if (state.currentDetail && state.currentDetail.id === detail.id) renderDetail();
-  
-    // A note-only edit does not change KPI/queue/document summary values, so
-    // preserve the expanded Admin card and avoid a full dashboard + document reload.
-    if (!options.preserveAdminList) {
-      state.admin = null;
-      await loadAdmin();
-    }
-  
-    idle();
-    toast(message);
+  const index = state.adminDocuments.items.findIndex(function (doc) {
+    return doc.id === detail.id;
+  });
+
+  if (index < 0) return;
+
+  const current = state.adminDocuments.items[index];
+
+  state.adminDocuments.items[index] = Object.assign({}, current, {
+    documentType: detail.documentType,
+    documentNumber: detail.documentNumber,
+    reqNumber: detail.reqNumber,
+    poNumber: detail.poNumber,
+    poNumbers: detail.poNumbers || [],
+    displayNumber: detail.displayNumber,
+    cloudDriveName: detail.cloudDriveName,
+    branchPlant: detail.branchPlant,
+    shipToAddress: detail.shipToAddress,
+    requestedDate: detail.requestedDate,
+    importedDeliveryDate: detail.importedDeliveryDate,
+    vendorName: detail.vendorName,
+    vendorPoNumber: detail.vendorPoNumber,
+    status: detail.status,
+    totalLines: detail.totalLines,
+    quantityOrdered: detail.quantityOrdered,
+    quantityReceivedGood: detail.quantityReceivedGood,
+    quantityOpen: detail.quantityOpen,
+    quantityDamaged: detail.quantityDamaged,
+    quantityIncorrect: detail.quantityIncorrect,
+    quantityNotHere: detail.quantityNotHere,
+    quantityVendorBackordered: detail.quantityVendorBackordered,
+    hasReqNote: Boolean(detail.headerAdminNotes),
+    hasNotes: Boolean(detail.headerAdminNotes),
+    updatedAt: new Date().toISOString()
+  });
+}
+
+async function refreshAdminDashboardOnly() {
+  if (!state.admin) return;
+  state.admin = await callServer('poAdminDashboard');
+  renderAdmin();
+}
+
+async function finishAdminEdit(detail, message, options = {}) {
+  state.currentDetail =
+    state.currentDetail && state.currentDetail.id === detail.id
+      ? detail
+      : state.currentDetail;
+
+  state.adminDocumentDetails[detail.id] = detail;
+  patchAdminDocumentSummaryFromDetail(detail);
+  renderAdminDocuments();
+
+  if (state.currentDetail && state.currentDetail.id === detail.id) {
+    renderDetail();
   }
+
+  if (options.refreshDashboardOnly) {
+    await refreshAdminDashboardOnly();
+  } else if (!options.preserveAdminList) {
+    state.admin = null;
+    await loadAdmin();
+  }
+
+  idle();
+  toast(message);
+}
+
   
   async function editReqModal(procurementId) {
-    try {
-      busy('Loading req...');
-      const detail = await getAdminDetail(procurementId);
-      idle();
-      openModal(`<h3>Edit Req / PO</h3><p class="meta">Use this when corporate changes the Req # or PO #. Check the box when one PO applies to every active item on the req.</p><form id="editReqForm" class="form-grid"><label>Req number<input id="editReqNumber" value="${escapeHtml(detail.reqNumber || detail.documentNumber || '')}" required></label><label>Primary PO number<input id="editPoNumber" value="${escapeHtml(detail.poNumber || '')}" required></label><label><input id="editPoApplyLines" type="checkbox" checked> Apply PO to all active items</label><button class="primary">Save identifiers</button></form>`);
-      $('#editReqForm').addEventListener('submit', async event => {
-        event.preventDefault();
-        const form = event.currentTarget;
-        if (form.dataset.submitting === 'YES') return;
-        try {
-          lockForm(form, true);
-          busy('Saving Req / PO...');
-          const result = await callServer('poUpdateReqPoIdentifiers', {procurementId, reqNumber: $('#editReqNumber').value, primaryPoNumber: $('#editPoNumber').value, applyPoToLines: $('#editPoApplyLines').checked});
-          closeModal();
-          await finishAdminEdit(result, 'Req / PO identifiers updated.');
-        } catch (error) {
-          lockForm(form, false);
-          fail(error);
-        }
-      });
-    } catch (error) {
-      fail(error);
-    }
+  try {
+    busy('Loading req...');
+    const detail = await getAdminDetail(procurementId);
+    idle();
+
+    const currentReq = normalizeQuery(
+      detail.reqNumber || detail.documentNumber || ''
+    );
+
+    const storedPo = normalizeQuery(detail.poNumber || '');
+    const suggestedPo = storedPo || currentReq;
+
+    openModal(
+      `<h3>Edit Req / PO</h3>
+       <p class="meta">
+         The R5543500 Order Number is used as the initial PO when a separate PO
+         has not yet been assigned. You can replace it later or split selected
+         lines across multiple POs.
+       </p>
+       <form id="editReqForm" class="form-grid">
+         <label>Req / Order number
+           <input id="editReqNumber" value="${escapeHtml(currentReq)}" required>
+         </label>
+         <label>Primary PO number
+           <input id="editPoNumber" value="${escapeHtml(suggestedPo)}" required>
+         </label>
+         <label>
+           <input id="editPoApplyLines" type="checkbox" checked>
+           Apply PO to all active items
+         </label>
+         <button class="primary">Save identifiers</button>
+       </form>`
+    );
+
+    $('#editReqForm').addEventListener('submit', async event => {
+      event.preventDefault();
+
+      const form = event.currentTarget;
+      if (form.dataset.submitting === 'YES') return;
+
+      const nextReq = normalizeQuery($('#editReqNumber').value);
+      const nextPo = normalizeQuery($('#editPoNumber').value);
+      const applyPoToLines = $('#editPoApplyLines').checked;
+
+      const linePoNeedsUpdate =
+        applyPoToLines &&
+        detail.lines.some(function (line) {
+          return normalizeQuery(line.poNumber) !== nextPo;
+        });
+
+      if (
+        nextReq === currentReq &&
+        nextPo === storedPo &&
+        !linePoNeedsUpdate
+      ) {
+        closeModal();
+        idle();
+        toast('No Req / PO changes were needed.');
+        return;
+      }
+
+      try {
+        lockForm(form, true);
+        busy('Saving Req / PO...');
+
+        const result = await callServer(
+          'poUpdateReqPoIdentifiers',
+          {
+            procurementId: procurementId,
+            reqNumber: nextReq,
+            primaryPoNumber: nextPo,
+            applyPoToLines: applyPoToLines
+          }
+        );
+
+        closeModal();
+
+        await finishAdminEdit(
+          result,
+          'Req / PO identifiers updated.',
+          {preserveAdminList: true}
+        );
+      } catch (error) {
+        lockForm(form, false);
+        fail(error);
+      }
+    });
+  } catch (error) {
+    fail(error);
   }
+}
+
   
   function assignSelectedPoModal(procurementId) {
     const lineIds = selectedAdminLineIds(procurementId);
@@ -804,7 +926,11 @@ async function loadAdminDocumentNotes(procurementId) {
         busy('Assigning PO...');
         const result = await callServer('poAssignLinesToPo', {procurementId, lineIds, poNumber: $('#assignPoNumber').value, notes: $('#assignPoNotes').value});
         closeModal();
-        await finishAdminEdit(result, 'Selected items assigned to PO.');
+        await finishAdminEdit(
+          result,
+          'Selected items assigned to PO.',
+          {preserveAdminList: true}
+        );
       } catch (error) {
         lockForm(form, false);
         fail(error);
@@ -823,7 +949,11 @@ async function loadAdminDocumentNotes(procurementId) {
         busy('Adding item...');
         const result = await callServer('poAddReqLine', {procurementId, lineNumber: $('#addLineNumber').value, poNumber: $('#addLinePo').value, quantityOrdered: Number($('#addLineQty').value), uom: $('#addLineUom').value, description: $('#addLineDesc').value, jobNumber: $('#addLineJob').value, accountNumber: $('#addLineAccount').value, unitPrice: Number($('#addLineUnitPrice').value || 0), promisedDate: $('#addLinePromised').value, adminNotes: $('#addLineNotes').value});
         closeModal();
-        await finishAdminEdit(result, 'Item added to req.');
+        await finishAdminEdit(
+          result,
+          'Item added to req.',
+          {refreshDashboardOnly: true}
+        );
       } catch (error) {
         lockForm(form, false);
         fail(error);
@@ -834,7 +964,7 @@ async function loadAdminDocumentNotes(procurementId) {
   function deleteSelectedLinesModal(procurementId) {
     const lineIds = selectedAdminLineIds(procurementId);
     if (!lineIds.length) return toast('Select at least one item to delete.', true);
-    openModal(`<h3>Delete selected items</h3><p class="error-text">This is a soft-delete. Items with field activity, damage, or backorders are blocked.</p><form id="deleteLinesForm" class="form-grid"><textarea id="deleteLinesReason" placeholder="Reason" required></textarea><button class="danger">Delete selected items</button></form>`);
+    openModal(`<h3>Delete selected items</h3><p class="error-text">This is a soft-delete. Items with physical receipt activity (Here, Damaged, or Incorrect Item) are blocked. Not Here / Vendor Backorder history can be cancelled while the immutable transaction history remains.</p><form id="deleteLinesForm" class="form-grid"><textarea id="deleteLinesReason" placeholder="Reason" required></textarea><button class="danger">Delete selected items</button></form>`);
     $('#deleteLinesForm').addEventListener('submit', async event => {
       event.preventDefault();
       const form = event.currentTarget;
@@ -844,7 +974,11 @@ async function loadAdminDocumentNotes(procurementId) {
         busy('Deleting selected items...');
         const result = await callServer('poDeleteReqLines', {procurementId, lineIds, reason: $('#deleteLinesReason').value});
         closeModal();
-        await finishAdminEdit(result, 'Selected items deleted.');
+        await finishAdminEdit(
+          result,
+          'Selected items deleted.',
+          {refreshDashboardOnly: true}
+        );
       } catch (error) {
         lockForm(form, false);
         fail(error);

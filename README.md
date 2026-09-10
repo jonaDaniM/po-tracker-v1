@@ -91,6 +91,18 @@ Ordered, received, and open quantities are canonical totals. Damaged, incorrect-
 
 Do not hard-code production IDs throughout the source. The Bound app reads the selected environment from Apps Script properties so TEST and PRODUCTION stay isolated.
 
+## Order-number default and cancellation policy
+
+For R5543500 requisition imports, PO Tracker uses the parsed numeric `ORDER NUMBER`
+as the initial PO value when the requisition is first staged/published. Admin Edit
+users can still replace the Primary PO later or split selected lines across multiple POs.
+
+Admin soft-delete protects records with evidence that material was physically received:
+`RECEIVED_GOOD`, `DAMAGED_REPORTED`, and `INCORRECT_ITEM_REPORTED`.
+
+`NOT_HERE` and `VENDOR_BACKORDER_CONFIRMED` do not by themselves prove physical receipt.
+Those records may be cancelled while transaction, audit, and deletion history remains traceable.
+
 ## Safety model
 
 PO Tracker is intentionally conservative:
