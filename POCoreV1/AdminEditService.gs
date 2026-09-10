@@ -24,11 +24,39 @@ function activeLinesByIdsPoV1_(procurementId, lineIds) {
   return lines;
 }
 
-function lineHasOperationalActivityPoV1_(line) {
-  const lineId = normalizePoV1_(line.Procurement_Line_ID);
-  if (numberPoV1_(line.Qty_Received_Good) || numberPoV1_(line.Qty_Damaged_Open) || numberPoV1_(line.Qty_Incorrect_Open) || numberPoV1_(line.Qty_Not_Here_Open) || numberPoV1_(line.Qty_Vendor_Backordered)) return true;
-  return recordsByFieldPoV1_(PO_V1.SHEETS.TRANSACTIONS, 'Procurement_Line_ID', lineId).some(function (row) { return yesPoV1_(row.Active); });
+function linesWithOperationalActivityPoV1_(procurementId, lines) {
+  const sourceLines = Array.isArray(lines) ? lines : [];
+  if (!sourceLines.length) return [];
+
+  const wanted = {};
+  const blocked = {};
+  sourceLines.forEach(function (line) {
+    const lineId = normalizePoV1_(line.Procurement_Line_ID);
+    if (!lineId) return;
+    wanted[lineId] = true;
+    if (
+      numberPoV1_(line.Qty_Received_Good) ||
+      numberPoV1_(line.Qty_Damaged_Open) ||
+      numberPoV1_(line.Qty_Incorrect_Open) ||
+      numberPoV1_(line.Qty_Not_Here_Open) ||
+      numberPoV1_(line.Qty_Vendor_Backordered)
+    ) {
+      blocked[lineId] = true;
+    }
+  });
+
+  // One requisition-level transaction read replaces one TextFinder/read per line.
+  recordsByFieldPoV1_(PO_V1.SHEETS.TRANSACTIONS, 'Procurement_ID', procurementId)
+    .forEach(function (row) {
+      const lineId = normalizePoV1_(row.Procurement_Line_ID);
+      if (wanted[lineId] && yesPoV1_(row.Active)) blocked[lineId] = true;
+    });
+
+  return sourceLines.filter(function (line) {
+    return Boolean(blocked[normalizePoV1_(line.Procurement_Line_ID)]);
+  });
 }
+
 
 function deletionRecordPoV1_(entityType, record, user, reason, correlationId) {
   return {
@@ -52,18 +80,30 @@ function deletionRecordPoV1_(entityType, record, user, reason, correlationId) {
 }
 
 function syncActiveOperationalLabelsForLinesPoV1_(lines, patchForLine) {
+  const sourceLines = Array.isArray(lines) ? lines : [];
+  if (!sourceLines.length) return;
+
   const linePatchById = {};
-  lines.forEach(function (line) {
+  let procurementId = '';
+  sourceLines.forEach(function (line) {
+    procurementId = procurementId || normalizePoV1_(line.Procurement_ID);
+    const lineId = normalizePoV1_(line.Procurement_Line_ID);
     const patch = patchForLine(line);
-    if (patch) linePatchById[normalizePoV1_(line.Procurement_Line_ID)] = patch;
+    if (lineId && patch) linePatchById[lineId] = patch;
   });
+
+  if (!procurementId || !Object.keys(linePatchById).length) return;
+
   [PO_V1.SHEETS.EXCEPTIONS, PO_V1.SHEETS.BACKORDERS].forEach(function (sheetName) {
-    const updates = [];
-    Object.keys(linePatchById).forEach(function (lineId) {
-      recordsByFieldPoV1_(sheetName, 'Procurement_Line_ID', lineId).forEach(function (row) {
-        if (yesPoV1_(row.Active)) updates.push({rowNumber: row._rowNumber, patch: linePatchById[lineId]});
+    const updates = recordsByFieldPoV1_(sheetName, 'Procurement_ID', procurementId)
+      .filter(function (row) {
+        const lineId = normalizePoV1_(row.Procurement_Line_ID);
+        return yesPoV1_(row.Active) && Object.prototype.hasOwnProperty.call(linePatchById, lineId);
+      })
+      .map(function (row) {
+        const lineId = normalizePoV1_(row.Procurement_Line_ID);
+        return {rowNumber: row._rowNumber, patch: linePatchById[lineId]};
       });
-    });
     updateRowObjectsPoV1_(sheetName, updates);
   });
 }
@@ -210,7 +250,7 @@ function deleteProcurementLinesPoV1_(userEmail, request) {
   try {
     activeProcurementHeaderPoV1_(procurementId);
     const lines = activeLinesByIdsPoV1_(procurementId, source.lineIds);
-    const blocked = lines.filter(lineHasOperationalActivityPoV1_);
+    const blocked = linesWithOperationalActivityPoV1_(procurementId, lines);
     if (blocked.length) throw new Error('Line(s) with receiving, exception, or backorder activity cannot be deleted by Admin. Correct the activity first: ' + blocked.map(function (line) { return line.Line_Number; }).join(', '));
     const now = nowPoV1_();
     const correlationId = uuidPoV1_('CORR');
@@ -237,7 +277,7 @@ function deleteProcurementPoV1_(userEmail, request) {
   try {
     const header = activeProcurementHeaderPoV1_(procurementId);
     const lines = activeLinesForProcurementPoV1_(procurementId);
-    const blocked = lines.filter(lineHasOperationalActivityPoV1_);
+    const blocked = linesWithOperationalActivityPoV1_(procurementId, lines);
     if (blocked.length) throw new Error('This req has receiving, exception, or backorder activity and cannot be deleted by Admin. Correct activity first or ask an Owner to review.');
     const now = nowPoV1_();
     const correlationId = uuidPoV1_('CORR');

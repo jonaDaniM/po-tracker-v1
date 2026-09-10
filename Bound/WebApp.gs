@@ -7,6 +7,12 @@ function doGet() {
 function includePo_(name) { return HtmlService.createHtmlOutputFromFile(name).getContent(); }
 
 function poBootstrap() { const c = poBoundContext_(); return POCoreV1.getPoTrackerBootstrap(c.databaseId, c.email); }
+
+function poRecordAccess() {
+  const c = poBoundContext_();
+  return POCoreV1.getRecentPoTrackerAccess(c.databaseId, c.email);
+}
+
 function poSearch(query) { const c = poBoundContext_(); return POCoreV1.searchPoTracker(c.databaseId, c.email, query); }
 function poDetail(procurementId) { const c = poBoundContext_(); return POCoreV1.getPoTrackerDetail(c.databaseId, c.email, procurementId); }
 function poReceive(request) { const c = poBoundContext_(); return POCoreV1.performPoReceivingAction(c.databaseId, c.email, request); }

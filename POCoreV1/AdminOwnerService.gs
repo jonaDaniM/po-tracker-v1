@@ -1,10 +1,17 @@
 function getPoTrackerBootstrapInternal_(userEmail) {
   const user = assertSearchUserPoV1_(userEmail);
-  recordUserAccessPoV1_(user.email, user.canOwnerEdit ? 'OWNER' : (user.canAdminManage ? 'ADMIN' : 'FIELD'));
   const configuration = getPoV1Configuration_();
-  return {version: PO_V1.VERSION, schemaVersion: PO_V1.SCHEMA_VERSION, parserVersion: PO_V1.PARSER_VERSION, databaseFingerprint: databaseFingerprintPoV1_(),
-    environment: normalizeUpperPoV1_(configuration.ENVIRONMENT_NAME || 'TEST'), transactionMode: normalizeUpperPoV1_(configuration.TRANSACTION_MODE || 'READ_ONLY'),
-    timezone: normalizePoV1_(configuration.TIMEZONE) || 'America/Indiana/Indianapolis', user: user};
+
+  return {
+    version: PO_V1.VERSION,
+    schemaVersion: PO_V1.SCHEMA_VERSION,
+    parserVersion: PO_V1.PARSER_VERSION,
+    databaseFingerprint: databaseFingerprintPoV1_(),
+    environment: normalizeUpperPoV1_(configuration.ENVIRONMENT_NAME || 'TEST'),
+    transactionMode: normalizeUpperPoV1_(configuration.TRANSACTION_MODE || 'READ_ONLY'),
+    timezone: normalizePoV1_(configuration.TIMEZONE) || 'America/Indiana/Indianapolis',
+    user: user
+  };
 }
 
 function recentFieldTransactionsPoV1_(limit) {

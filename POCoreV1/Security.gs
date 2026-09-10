@@ -94,14 +94,45 @@ function assertOwnerPoV1_(email) {
   return user;
 }
 
+function userAccessTouchCacheKeyPoV1_(email) {
+  return 'po1:' +
+    databaseFingerprintPoV1_() +
+    ':access-touch:' +
+    contentFingerprintPoV1_(normalizeEmailPoV1_(email)).slice(0, 24);
+}
+
 function recordUserAccessPoV1_(email, interfaceName) {
-  const rows = findRowsByExactValuePoV1_(PO_V1.SHEETS.USERS, 'Email', normalizeEmailPoV1_(email));
-  if (rows.length === 1) {
-    updateRowObjectPoV1_(PO_V1.SHEETS.USERS, rows[0], {
+  const normalizedEmail = normalizeEmailPoV1_(email);
+  if (!normalizedEmail) return {recorded: false, reason: 'NO_EMAIL'};
+
+  const cache = CacheService.getScriptCache();
+  const cacheKey = userAccessTouchCacheKeyPoV1_(normalizedEmail);
+
+  if (cache.get(cacheKey)) {
+    return {recorded: false, reason: 'RATE_LIMITED'};
+  }
+
+  const rows = findRowsByExactValuePoV1_(
+    PO_V1.SHEETS.USERS,
+    'Email',
+    normalizedEmail
+  );
+
+  if (rows.length !== 1) {
+    return {recorded: false, reason: 'USER_ROW_NOT_UNIQUE'};
+  }
+
+  updateRowObjectPoV1_(
+    PO_V1.SHEETS.USERS,
+    rows[0],
+    {
       Last_Login_At: nowPoV1_(),
       Last_Interface: normalizeUpperPoV1_(interfaceName || 'PORTAL')
-    });
-  }
+    }
+  );
+
+  cache.put(cacheKey, '1', 1800);
+  return {recorded: true};
 }
 
 function bootstrapPoTrackerDatabaseInternal_(databaseId, email, displayName, environment) {

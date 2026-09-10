@@ -184,6 +184,36 @@ function findRowsByExactValuePoV1_(sheetName, fieldName, value) {
     .createTextFinder(target).matchEntireCell(true).findAll().map(function (range) { return range.getRow(); });
 }
 
+function findRowsByAnyExactValuePoV1_(sheetName, fieldName, values) {
+  const targets = {};
+  (Array.isArray(values) ? values : []).forEach(function (value) {
+    const normalized = normalizeUpperPoV1_(value);
+    if (normalized) targets[normalized] = true;
+  });
+
+  if (!Object.keys(targets).length) return [];
+
+  const contract = headerMapPoV1_(sheetName);
+  if (!Object.prototype.hasOwnProperty.call(contract.indexByHeader, fieldName)) {
+    throw new Error('Unknown field ' + fieldName + ' on ' + sheetName + '.');
+  }
+
+  const sheet = sheetPoV1_(sheetName);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+
+  const columnValues = sheet
+    .getRange(2, contract.indexByHeader[fieldName] + 1, lastRow - 1, 1)
+    .getDisplayValues();
+
+  const rows = [];
+  columnValues.forEach(function (row, index) {
+    if (targets[normalizeUpperPoV1_(row[0])]) rows.push(index + 2);
+  });
+
+  return rows;
+}
+
 function findRecordByFieldPoV1_(sheetName, fieldName, value) {
   const rows = findRowsByExactValuePoV1_(sheetName, fieldName, value);
   if (rows.length > 1) throw new Error('Duplicate ' + fieldName + ' values exist on ' + sheetName + ': ' + value);

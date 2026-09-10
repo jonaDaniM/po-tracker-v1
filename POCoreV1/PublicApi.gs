@@ -14,8 +14,31 @@ function poV1Call_(databaseId, callback) { setPoV1DatabaseContext_(databaseId); 
 function getPoTrackerVersion() { return {version: PO_V1.VERSION, schemaVersion: PO_V1.SCHEMA_VERSION, parserVersion: PO_V1.PARSER_VERSION}; }
 function bootstrapPoTrackerDatabase(databaseId, authenticatedEmail, displayName, environment) { return poV1PublicValue_(bootstrapPoTrackerDatabaseInternal_(databaseId, authenticatedEmail, displayName, environment)); }
 function getPoTrackerBootstrap(databaseId, authenticatedEmail) { return poV1Call_(databaseId, function () { return getPoTrackerBootstrapInternal_(authenticatedEmail); }); }
+
+function recordPoTrackerAccess(databaseId, authenticatedEmail) {
+  return poV1Call_(databaseId, function () {
+    const user = assertSearchUserPoV1_(authenticatedEmail);
+    const interfaceName = user.canOwnerEdit
+      ? 'OWNER'
+      : (user.canAdminManage ? 'ADMIN' : 'FIELD');
+
+    return recordUserAccessPoV1_(user.email, interfaceName);
+  });
+}
 function searchPoTracker(databaseId, authenticatedEmail, query) { return poV1Call_(databaseId, function () { return searchProcurementPoV1_(authenticatedEmail, query); }); }
-function getPoTrackerDetail(databaseId, authenticatedEmail, procurementId) { return poV1Call_(databaseId, function () { return getProcurementDetailPoV1_(authenticatedEmail, procurementId); }); }
+
+function getPoTrackerDetail(databaseId, authenticatedEmail, procurementId, options) {
+  return poV1Call_(databaseId, function () {
+    return getProcurementDetailPoV1_(authenticatedEmail, procurementId, options);
+  });
+}
+
+function getPoTrackerLineNotes(databaseId, authenticatedEmail, procurementId, lineIds) {
+  return poV1Call_(databaseId, function () {
+    return getProcurementLineNotesPoV1_(authenticatedEmail, procurementId, lineIds);
+  });
+}
+
 function performPoReceivingAction(databaseId, authenticatedEmail, request) { return poV1Call_(databaseId, function () { return performReceivingActionPoV1_(authenticatedEmail, request); }); }
 function createPoImportBatch(databaseId, authenticatedEmail, notes) { return poV1Call_(databaseId, function () { return createImportBatchPoV1_(authenticatedEmail, notes); }); }
 function uploadPoImportFile(databaseId, authenticatedEmail, payload) { return poV1Call_(databaseId, function () { return uploadImportFilePoV1_(authenticatedEmail, payload); }); }
